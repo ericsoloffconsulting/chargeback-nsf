@@ -98,7 +98,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
             // Create NetSuite form
             var form = serverWidget.createForm({
-                title: 'Chargeback & NSF Check Processing'
+                title: 'Chargeback, NSF Check and Duplicate Refund Processing'
             });
 
             try {
@@ -610,9 +610,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-  * Handles AJAX request for paid invoices AND unapplied deposits
-  * @param {Object} context
-  */
+   * Handles AJAX request for paid invoices, unapplied deposits, AND customer refunds
+   * @param {Object} context
+   */
         function handlePaidInvoicesRequest(context) {
             var request = context.request;
             var response = context.response;
@@ -623,15 +623,79 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             try {
                 var invoices = searchPaidInvoices(customerId);
                 var deposits = searchUnappliedDeposits(customerId);
+                var refunds = searchCustomerRefunds(customerId); // NEW
 
                 response.write(JSON.stringify({
                     invoices: invoices,
-                    deposits: deposits
+                    deposits: deposits,
+                    refunds: refunds // NEW
                 }));
             } catch (e) {
                 log.error('Transaction Search Error', 'Error: ' + e.toString() + ' | Stack: ' + e.stack);
                 response.write(JSON.stringify({ error: e.toString() }));
             }
+        }
+
+        /**
+ * NEW: Searches for customer refunds for a specific customer
+ * @param {string} customerId - Customer internal ID
+ * @returns {Array} Array of refund objects
+ */
+        function searchCustomerRefunds(customerId) {
+            if (!customerId) {
+                return [];
+            }
+
+            log.debug('Searching Customer Refunds', 'Customer ID: ' + customerId);
+
+            var refundSearch = search.create({
+                type: search.Type.CUSTOMER_REFUND,
+                filters: [
+                    ['entity', 'anyof', customerId],
+                    'AND',
+                    ['mainline', 'is', 'T']
+                    // REMOVED: The type filter - it's redundant when using search.Type.CUSTOMER_REFUND
+                ],
+                columns: [
+                    search.createColumn({ name: 'tranid', sort: search.Sort.DESC }),
+                    search.createColumn({ name: 'trandate' }),
+                    search.createColumn({ name: 'total' }),
+                    search.createColumn({ name: 'memo' }),
+                    search.createColumn({ name: 'status' })
+                ]
+            });
+
+            var results = [];
+            var resultCount = 0;
+            refundSearch.run().each(function (result) {
+                resultCount++;
+                log.debug('Refund Found', {
+                    id: result.id,
+                    tranid: result.getValue('tranid'),
+                    customer: result.getText('entity'),
+                    amount: result.getValue('total')
+                });
+
+                results.push({
+                    id: result.id,
+                    tranid: result.getValue('tranid'),
+                    date: result.getValue('trandate'),
+                    amount: result.getValue('total'),
+                    memo: result.getValue('memo') || '',
+                    status: result.getText('status')
+                });
+
+                return results.length < 1000; // Limit results
+            });
+
+            log.debug('Customer Refunds Search Complete', {
+                customerId: customerId,
+                totalFound: resultCount,
+                resultsReturned: results.length
+            });
+
+            log.debug('Customer Refunds Found', 'Count: ' + results.length);
+            return results;
         }
 
         /**
@@ -929,37 +993,28 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '&deploy=' + runtime.getCurrentScript().deploymentId : '';
 
             var html = '<style>' + getStyles() + '</style>';
-
-            // Add JavaScript functions
             html += '<script>' + getJavaScript(scriptUrl) + '</script>';
-
-            // Add loading overlay HTML
             html += '<div id="loadingOverlay" class="loading-overlay">' +
                 '<div class="loading-content">' +
                 '<div class="loading-spinner"></div>' +
                 '<div id="loadingText" class="loading-text">Processing...</div>' +
                 '</div>' +
                 '</div>';
-
-            // Main container
             html += '<div class="chargeback-container">';
 
-            // Success message for chargeback/NSF processing
+            // Success messages
             if (params.success === 'true') {
                 html += buildSuccessMessage(params);
             }
 
-            // Success message for reverse chargeback
             if (params.reverseSuccess === 'true') {
                 html += buildReverseSuccessMessage(params);
             }
 
-            // Success message for JE write-off
             if (params.writeOffSuccess === 'true') {
                 html += buildWriteOffSuccessMessage(params);
             }
 
-            // Success message for file upload
             if (params.uploadSuccess === 'true') {
                 var fileName = decodeURIComponent(params.fileName || 'file');
                 var invoiceTranId = params.invoice || '';
@@ -970,7 +1025,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 html += '</div>';
             }
 
-            // UPDATED: Success message for marking dispute uploaded - now includes case number
             if (params.disputeMarkedSuccess === 'true') {
                 var customer = decodeURIComponent(params.customer || 'Customer');
                 var invoiceTranId = params.invoice || '';
@@ -985,12 +1039,15 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 html += '</div>';
             }
 
-            // In buildPageHTML(), add after other success messages:
             if (params.depositRefundSuccess === 'true') {
                 html += buildDepositRefundSuccessMessage(params);
             }
 
-            // Error message
+            // NEW: Duplicate refund success message
+            if (params.duplicateRefundSuccess === 'true') {
+                html += buildDuplicateRefundSuccessMessage(params);
+            }
+
             if (params.error) {
                 html += '<div class="error-msg">' + escapeHtml(decodeURIComponent(params.error)) + '</div>';
             }
@@ -1006,7 +1063,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
             // Chargeback Dispute Submissions section
             html += '<div class="search-title" style="margin-top: 30px;">Chargeback Dispute Submissions</div>';
-            html += '<div class="search-count">Credit card chargebacks pending dispute file attachments</div>';
+            html += '<div class="search-count">Credit card chargebacks and duplicate refunds pending dispute file attachments</div>';
             html += buildDisputeSubmissionsTable();
 
             // Global chargeback tracking section
@@ -1014,6 +1071,33 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             html += '<div class="search-count">All customers with open chargeback or NSF check invoices</div>';
             html += buildGlobalTrackingTable();
 
+            html += '</div>';
+
+            return html;
+        }
+
+        /**
+ * NEW: Builds success message for duplicate refund processing
+ */
+        function buildDuplicateRefundSuccessMessage(params) {
+            var type = params.type || 'chargeback';
+            var customer = decodeURIComponent(params.customer || 'Customer');
+            var creditMemoId = params.creditMemoId || '';
+            var creditMemoTranId = params.creditMemoTranId || creditMemoId; // NEW: Use tranid, fallback to ID
+            var refundId = params.refundId || '';
+            var refundTranId = params.refundTranId || refundId; // NEW: Use tranid, fallback to ID
+            var newInvoiceId = params.newInvoiceId || '';
+            var newInvoiceTranId = params.newInvoiceTranId || newInvoiceId; // NEW: Use tranid, fallback to ID
+            var amount = params.amount || '0.00';
+
+            var typeText = type === 'freedompay' ? 'Duplicate FreedomPay Refund' : 'Duplicate Chargeback Refund';
+
+            var html = '<div class="success-msg">';
+            html += '<strong>' + typeText + ' Processed Successfully for ' + escapeHtml(customer) + '</strong><br>';
+            html += 'Credit Memo: <a href="/app/accounting/transactions/custcred.nl?id=' + creditMemoId + '" target="_blank">' + escapeHtml(creditMemoTranId) + '</a><br>';
+            html += 'Customer Refund: <a href="/app/accounting/transactions/custrfnd.nl?id=' + refundId + '" target="_blank">' + escapeHtml(refundTranId) + '</a><br>';
+            html += 'New Invoice: <a href="/app/accounting/transactions/custinvc.nl?id=' + newInvoiceId + '" target="_blank">' + escapeHtml(newInvoiceTranId) + '</a><br>';
+            html += 'Amount: $' + parseFloat(amount).toFixed(2);
             html += '</div>';
 
             return html;
@@ -1307,10 +1391,11 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-         * Helper function to determine chargeback type from invoice items
-         * @param {string} invoiceId - Invoice internal ID
-         * @returns {string} Chargeback type
-         */
+ * Helper function to determine chargeback type from invoice items
+ * UPDATED to include Duplicate FreedomPay item
+ * @param {string} invoiceId - Invoice internal ID
+ * @returns {string} Chargeback type
+ */
         function getChargebackTypeFromInvoice(invoiceId) {
             try {
                 var itemSearch = search.create({
@@ -1320,7 +1405,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         'AND',
                         ['mainline', 'is', 'F'],
                         'AND',
-                        ['item', 'anyof', ['304416', '304429']]
+                        ['item', 'anyof', ['304416', '304429', '304779']] // UPDATED: Added 304779
                     ],
                     columns: ['item']
                 });
@@ -1331,7 +1416,10 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     var itemId = result.getValue('item');
                     if (itemId === '304429') {
                         chargebackType = 'Fraud Chargeback';
-                        return false; // Stop searching, we found fraud
+                        return false;
+                    } else if (itemId === '304779') {
+                        chargebackType = 'Duplicate FreedomPay Refund';
+                        return false;
                     } else if (itemId === '304416') {
                         chargebackType = 'Dispute Chargeback';
                     }
@@ -1351,12 +1439,12 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
 
         /**
-    * Searches for chargebacks (dispute and fraud) that need dispute file attachments
-    * REWRITTEN to properly retrieve header-level checkbox and memo data
-    * @returns {Array} Array of invoice objects with attachment info
-    */
+  * Searches for chargebacks (dispute and fraud) that need dispute file attachments
+  * UPDATED to include item 304779 (Duplicate FreedomPay Refund in Error)
+  * @returns {Array} Array of invoice objects with attachment info
+  */
         function searchChargebacksNeedingDisputeFiles() {
-            log.debug('Searching Chargebacks Needing Dispute Files', 'Items: 304416 (CC Dispute), 304429 (Fraud)');
+            log.debug('Searching Chargebacks Needing Dispute Files', 'Items: 304416 (CC Dispute), 304429 (Fraud), 304779 (Dup FreedomPay)');
 
             // STEP 1: Search for invoices with the chargeback items (line level search)
             var itemSearch = search.create({
@@ -1366,7 +1454,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     'AND',
                     ['mainline', 'is', 'F'], // Line level
                     'AND',
-                    ['item', 'anyof', ['304416', '304429']]
+                    ['item', 'anyof', ['304416', '304429', '304779']] // UPDATED: Added 304779
                 ],
                 columns: [
                     'internalid'
@@ -1393,7 +1481,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             }
 
             // STEP 2: Now search at header level for these specific invoices
-            // and check the checkbox field
             var headerSearch = search.create({
                 type: search.Type.INVOICE,
                 filters: [
@@ -1401,18 +1488,18 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     'AND',
                     ['internalid', 'anyof', invoiceIds],
                     'AND',
-                    ['mainline', 'is', 'T'], // HEADER LEVEL - this is the key!
+                    ['mainline', 'is', 'T'],
                     'AND',
-                    ['custbody_chargeback_dispute_submitted', 'is', 'F'] // Checkbox NOT checked
+                    ['custbody_chargeback_dispute_submitted', 'is', 'F']
                 ],
                 columns: [
                     search.createColumn({ name: 'tranid', sort: search.Sort.DESC }),
                     search.createColumn({ name: 'entity' }),
                     search.createColumn({ name: 'datecreated', sort: search.Sort.DESC }),
-                    search.createColumn({ name: 'amount' }), // Header amount
+                    search.createColumn({ name: 'amount' }),
                     search.createColumn({ name: 'status' }),
-                    search.createColumn({ name: 'memo' }), // Header memo
-                    search.createColumn({ name: 'custbody_chargeback_dispute_submitted' }) // Checkbox status
+                    search.createColumn({ name: 'memo' }),
+                    search.createColumn({ name: 'custbody_chargeback_dispute_submitted' })
                 ]
             });
 
@@ -1428,9 +1515,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     dateCreated: result.getValue('datecreated'),
                     amount: result.getValue('amount'),
                     status: result.getText('status'),
-                    memo: result.getValue('memo') || '', // NOW we'll get the memo!
+                    memo: result.getValue('memo') || '',
                     checkboxValue: result.getValue('custbody_chargeback_dispute_submitted'),
-                    type: 'Credit Card Chargeback' // Will be refined
+                    type: 'Credit Card Chargeback'
                 };
 
                 return true;
@@ -1441,7 +1528,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 afterCheckboxFilter: Object.keys(invoiceData).length
             });
 
-            // STEP 3: Get file attachments for the filtered invoices
+            // STEP 3: Get file attachments
             if (Object.keys(invoiceData).length === 0) {
                 return [];
             }
@@ -1474,7 +1561,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 var fileName = result.getValue({ name: 'name', join: 'file' });
 
                 if (fileId && fileName) {
-                    // Avoid duplicates
                     var fileExists = false;
                     for (var f = 0; f < invoiceFiles[invoiceId].length; f++) {
                         if (invoiceFiles[invoiceId][f].id === fileId) {
@@ -1493,7 +1579,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 return true;
             });
 
-            // STEP 4: Determine chargeback type for each invoice and build results
+            // STEP 4: Determine chargeback type and build results
             var results = [];
 
             for (var invoiceId in invoiceData) {
@@ -1508,7 +1594,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         amount: invoiceData[invoiceId].amount,
                         type: itemType,
                         status: invoiceData[invoiceId].status,
-                        memo: invoiceData[invoiceId].memo, // Now properly populated
+                        memo: invoiceData[invoiceId].memo,
                         checkboxValue: invoiceData[invoiceId].checkboxValue,
                         attachments: invoiceFiles[invoiceId] || []
                     });
@@ -1516,9 +1602,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             }
 
             log.debug('Final Results', {
-                count: results.length,
-                sampleMemo: results.length > 0 ? results[0].memo : 'N/A',
-                sampleCheckbox: results.length > 0 ? results[0].checkboxValue : 'N/A'
+                count: results.length
             });
 
             return results;
@@ -1719,7 +1803,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             log.debug('Open Chargeback Invoices Found', 'Count: ' + results.length);
             return results;
         }
-
+        /**
+         * Handles POST requests
+         */
         function handlePost(context) {
             var request = context.request;
             var params = request.parameters;
@@ -1736,9 +1822,15 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     return;
                 }
 
-                // NEW: Handle deposit refund processing
+                // Handle deposit refund processing
                 if (params.action === 'processDepositRefund') {
                     handleDepositRefund(context);
+                    return;
+                }
+
+                // NEW: Handle duplicate refund processing
+                if (params.action === 'processDuplicateRefund') {
+                    handleDuplicateRefund(context);
                     return;
                 }
 
@@ -1781,6 +1873,338 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     }
                 });
             }
+        }
+
+        /**
+ * NEW: Handles duplicate refund processing - creates CM, Refund, and Invoice from scratch
+ * @param {Object} context
+ */
+        function handleDuplicateRefund(context) {
+            var request = context.request;
+            var refundId = request.parameters.refundId;
+            var type = request.parameters.type; // 'freedompay' or 'chargeback'
+
+            log.audit('Duplicate Refund Request', {
+                refundId: refundId,
+                type: type
+            });
+
+            try {
+                if (!refundId || !type) {
+                    throw new Error('Refund ID and type are required');
+                }
+
+                var result = processDuplicateRefund(refundId, type);
+
+                redirect.toSuitelet({
+                    scriptId: runtime.getCurrentScript().id,
+                    deploymentId: runtime.getCurrentScript().deploymentId,
+                    parameters: {
+                        duplicateRefundSuccess: 'true',
+                        type: type,
+                        customer: encodeURIComponent(result.customerName),
+                        creditMemoId: result.creditMemoId,
+                        creditMemoTranId: result.creditMemoTranId, // NEW
+                        refundId: result.refundId,
+                        refundTranId: result.refundTranId, // NEW
+                        newInvoiceId: result.newInvoiceId,
+                        newInvoiceTranId: result.newInvoiceTranId, // NEW
+                        amount: result.amount
+                    }
+                });
+
+            } catch (e) {
+                log.error('Duplicate Refund Error', {
+                    error: e.toString(),
+                    stack: e.stack,
+                    refundId: refundId,
+                    type: type
+                });
+
+                redirect.toSuitelet({
+                    scriptId: runtime.getCurrentScript().id,
+                    deploymentId: runtime.getCurrentScript().deploymentId,
+                    parameters: {
+                        error: encodeURIComponent('Duplicate Refund Error: ' + e.toString())
+                    }
+                });
+            }
+        }
+
+        /**
+  * NEW: Processes duplicate refund - creates CM, Refund, and Invoice from scratch
+  * @param {string} originalRefundId - Original Customer Refund internal ID
+  * @param {string} type - 'freedompay' or 'chargeback'
+  * @returns {Object} Result with created record details
+  */
+        function processDuplicateRefund(originalRefundId, type) {
+            log.audit('Processing Duplicate Refund', {
+                originalRefundId: originalRefundId,
+                type: type
+            });
+
+            // Load the original refund to get details
+            var originalRefund = record.load({
+                type: record.Type.CUSTOMER_REFUND,
+                id: originalRefundId,
+                isDynamic: false
+            });
+
+            var customerId = originalRefund.getValue('customer');
+            var customerName = originalRefund.getText('customer');
+            var originalTranId = originalRefund.getValue('tranid');
+            var refundAmount = originalRefund.getValue('total');
+            var subsidiary = originalRefund.getValue('subsidiary');
+            var classField = originalRefund.getValue('class');
+
+            // Use placeholder values since refunds don't have location/department
+            var location = 108; // Retail G&A
+            var department = 107; // Retail G&A
+
+            log.debug('Original Refund Loaded', {
+                refundId: originalRefundId,
+                tranId: originalTranId,
+                customerId: customerId,
+                customerName: customerName,
+                amount: refundAmount,
+                location: location,
+                department: department
+            });
+
+            // Determine item ID and memo text based on type
+            var itemId;
+            var memoText;
+            var refundPrefix;
+
+            if (type === 'freedompay') {
+                itemId = '304779'; // Duplicate FreedomPay Refund in Error
+                memoText = 'Duplicate FreedomPay Refund in Error';
+                refundPrefix = 'DUP_FREEDOMPAY';
+            } else { // chargeback
+                itemId = '304416'; // Credit Card Dispute Chargeback
+                memoText = 'Duplicate Chargeback Refund';
+                refundPrefix = 'DUP_CHARGEBACK';
+            }
+
+            // STEP 1: Create Credit Memo from scratch
+            var creditMemo = record.create({
+                type: record.Type.CREDIT_MEMO,
+                isDynamic: true
+            });
+
+            creditMemo.setValue('entity', customerId);
+            creditMemo.setValue('trandate', new Date());
+            creditMemo.setValue('tobeemailed', false);
+
+            if (subsidiary) {
+                creditMemo.setValue('subsidiary', subsidiary);
+            }
+
+            // Set location at header level
+            creditMemo.setValue('location', location);
+
+            // Set department at header level
+            creditMemo.setValue('department', department);
+
+            creditMemo.setValue('memo', memoText + ' - Original Refund: ' + originalTranId);
+
+            // Add line item
+            creditMemo.selectNewLine({ sublistId: 'item' });
+            creditMemo.setCurrentSublistValue({
+                sublistId: 'item',
+                fieldId: 'item',
+                value: itemId
+            });
+            creditMemo.setCurrentSublistValue({
+                sublistId: 'item',
+                fieldId: 'amount',
+                value: refundAmount
+            });
+
+            // Set location on line
+            creditMemo.setCurrentSublistValue({
+                sublistId: 'item',
+                fieldId: 'location',
+                value: location
+            });
+
+            // Set department on line
+            creditMemo.setCurrentSublistValue({
+                sublistId: 'item',
+                fieldId: 'department',
+                value: department
+            });
+
+            if (classField) {
+                creditMemo.setCurrentSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'class',
+                    value: classField
+                });
+            }
+
+            creditMemo.commitLine({ sublistId: 'item' });
+
+            var creditMemoId = creditMemo.save();
+            log.audit('Credit Memo Created', 'ID: ' + creditMemoId + ' | Amount: ' + refundAmount);
+
+            // NEW: Get the credit memo tranid
+            var creditMemoRecord = record.load({
+                type: record.Type.CREDIT_MEMO,
+                id: creditMemoId,
+                isDynamic: false
+            });
+            var creditMemoTranId = creditMemoRecord.getValue('tranid');
+
+            // STEP 2: Create Customer Refund
+            var customerRefund = record.create({
+                type: record.Type.CUSTOMER_REFUND,
+                isDynamic: true
+            });
+
+            customerRefund.setValue('customer', customerId);
+            customerRefund.setValue('paymentmethod', '15'); // ACCT'G
+            customerRefund.setValue('memo', memoText + ' - Original Refund: ' + originalTranId);
+
+            var customTranId = refundPrefix + '_' + originalTranId;
+            customerRefund.setValue('tranid', customTranId);
+
+            // Set the refunded transaction
+            try {
+                customerRefund.setValue({
+                    fieldId: 'custbody_bas_refunded_transaction',
+                    value: creditMemoId
+                });
+            } catch (e) {
+                log.error('Error Setting Refunded Transaction', 'Error: ' + e.message);
+            }
+
+            customerRefund.setValue('total', refundAmount);
+
+            // Find and apply the credit memo
+            var applyLineCount = customerRefund.getLineCount({ sublistId: 'apply' });
+            var creditApplied = false;
+
+            for (var j = 0; j < applyLineCount; j++) {
+                var applyInternalId = customerRefund.getSublistValue({
+                    sublistId: 'apply',
+                    fieldId: 'internalid',
+                    line: j
+                });
+
+                if (applyInternalId == creditMemoId) {
+                    customerRefund.selectLine({
+                        sublistId: 'apply',
+                        line: j
+                    });
+                    customerRefund.setCurrentSublistValue({
+                        sublistId: 'apply',
+                        fieldId: 'apply',
+                        value: true
+                    });
+                    customerRefund.setCurrentSublistValue({
+                        sublistId: 'apply',
+                        fieldId: 'amount',
+                        value: refundAmount
+                    });
+                    customerRefund.commitLine({ sublistId: 'apply' });
+                    creditApplied = true;
+                    log.debug('Applied to Credit Memo', 'Line: ' + j + ' | Amount: ' + refundAmount);
+                    break;
+                }
+            }
+
+            if (!creditApplied) {
+                throw new Error('Could not find credit memo in refund apply list');
+            }
+
+            var refundId = customerRefund.save();
+            log.audit('Customer Refund Created', 'ID: ' + refundId + ' | Amount: ' + refundAmount);
+
+            // NEW: The custom tranid we set is what we want to return
+            var refundTranId = customTranId; // We already have this from earlier
+
+            // STEP 3: Create new invoice
+            var newInvoice = record.create({
+                type: record.Type.INVOICE,
+                isDynamic: true
+            });
+
+            newInvoice.setValue('entity', customerId);
+            newInvoice.setValue('trandate', new Date());
+            newInvoice.setValue('tobeemailed', false);
+            newInvoice.setValue('custbody_b4cp_gen_pay_online_link', true);
+
+            if (subsidiary) {
+                newInvoice.setValue('subsidiary', subsidiary);
+            }
+
+            // Set location at header level
+            newInvoice.setValue('location', location);
+
+            // Set department at header level
+            newInvoice.setValue('department', department);
+
+            newInvoice.setValue('memo', memoText + ' - Original Refund: ' + originalTranId);
+
+            // Add line item
+            newInvoice.selectNewLine({ sublistId: 'item' });
+            newInvoice.setCurrentSublistValue({
+                sublistId: 'item',
+                fieldId: 'item',
+                value: itemId
+            });
+            newInvoice.setCurrentSublistValue({
+                sublistId: 'item',
+                fieldId: 'amount',
+                value: refundAmount
+            });
+
+            // Set location on line
+            newInvoice.setCurrentSublistValue({
+                sublistId: 'item',
+                fieldId: 'location',
+                value: location
+            });
+
+            // Set department on line
+            newInvoice.setCurrentSublistValue({
+                sublistId: 'item',
+                fieldId: 'department',
+                value: department
+            });
+
+            if (classField) {
+                newInvoice.setCurrentSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'class',
+                    value: classField
+                });
+            }
+
+            newInvoice.commitLine({ sublistId: 'item' });
+
+            var newInvoiceId = newInvoice.save();
+            log.audit('New Invoice Created', 'ID: ' + newInvoiceId + ' | Amount: ' + refundAmount);
+
+            // NEW: Get the new invoice tranid
+            var newInvoiceRecord = record.load({
+                type: record.Type.INVOICE,
+                id: newInvoiceId,
+                isDynamic: false
+            });
+            var newInvoiceTranId = newInvoiceRecord.getValue('tranid');
+
+            return {
+                creditMemoId: creditMemoId,
+                creditMemoTranId: creditMemoTranId, // NEW
+                refundId: refundId,
+                refundTranId: refundTranId, // NEW
+                newInvoiceId: newInvoiceId,
+                newInvoiceTranId: newInvoiceTranId, // NEW
+                customerName: customerName,
+                amount: refundAmount
+            };
         }
 
         /**
@@ -2949,7 +3373,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '            document.getElementById("invoiceResults").innerHTML = "<div class=\\"error-msg\\">Error loading transactions: " + error + "</div>";' +
                 '        });' +
                 '}' +
-                // NEW: Smart scenario handler for invoices and deposits
                 'function displayInvoices(data) {' +
                 '    if (data.error) {' +
                 '        document.getElementById("invoiceResults").innerHTML = "<div class=\\"error-msg\\">Error: " + escapeHtmlClient(data.error) + "</div>";' +
@@ -2957,55 +3380,15 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    }' +
                 '    var invoices = data.invoices || [];' +
                 '    var deposits = data.deposits || [];' +
+                '    var refunds = data.refunds || [];' +
                 '    var html = "";' +
                 '    var hasInvoices = invoices.length > 0;' +
                 '    var hasDeposits = deposits.length > 0;' +
-                '    if (!hasInvoices && !hasDeposits) {' +
-                '        document.getElementById("invoiceResults").innerHTML = "<div class=\\"search-count\\">No paid invoices or unapplied deposits found for this customer</div>";' +
+                '    var hasRefunds = refunds.length > 0;' +
+                '    if (!hasInvoices && !hasDeposits && !hasRefunds) {' +
+                '        document.getElementById("invoiceResults").innerHTML = "<div class=\\"search-count\\">No paid invoices, unapplied deposits, or customer refunds found for this customer</div>";' +
                 '        return;' +
                 '    }' +
-                // SCENARIO 1: Only Invoices
-                '    if (hasInvoices && !hasDeposits) {' +
-                '        html += "<div class=\\"search-title\\" style=\\"margin-top: 15px;\\">Paid Invoices</div>";' +
-                '        html += "<div class=\\"search-count\\">Results: " + invoices.length + "</div>";' +
-                '        html += buildInvoicesTable(invoices);' +
-                '    }' +
-                // SCENARIO 2: Only Deposits
-                '    if (hasDeposits && !hasInvoices) {' +
-                '        html += "<div class=\\"search-title\\" style=\\"margin-top: 15px;\\">Unapplied Customer Deposits</div>";' +
-                '        html += "<div class=\\"search-count\\">Results: " + deposits.length + "</div>";' +
-                '        html += buildDepositsTable(deposits);' +
-                '    }' +
-                    /**
-                 * MIXED SCENARIO HANDLING METHODOLOGY
-                 * 
-                 * When a chargeback/NSF spans both invoiced amounts and unapplied customer deposits,
-                 * we intentionally process them separately rather than creating a single combined refund.
-                 * 
-                 * REASONING:
-                 * 1. NetSuite does not support partial linking of customer deposits to sales orders
-                 * 2. If we create a combined refund and link it to the SO:
-                 *    - The SO will show the FULL deposit amount as refunded (not just the unapplied portion)
-                 *    - This creates an inaccurate "overrefunded" appearance on the SO
-                 * 3. If we DON'T link the combined refund to the SO:
-                 *    - The SO won't show ANY refund against the deposit
-                 *    - This makes it appear the deposit was never refunded at all
-                 * 
-                 * SOLUTION - Process Separately:
-                 * 1. Process invoiced portion: Creates Credit Memo → Customer Refund (linked to CM)
-                 *    - Properly reflects A/R reversal for the invoiced amount
-                 * 2. Process deposit portion: Creates Customer Refund (linked to unapplied CD and SO)
-                 *    - Properly reflects only the unapplied deposit amount as refunded on the SO
-                 * 3. Both refunds hit "Undeposited Funds"
-                 * 4. Accounting combines them via Make Deposit to match bank records
-                 * 
-                 * This methodology provides:
-                 * - Accurate A/R reporting
-                 * - Accurate Sales Order balance due
-                 * - Accurate deposit refund tracking
-                 * - Clean bank reconciliation via combined Make Deposit
-                 */
-                // SCENARIO 3: HYBRID - Both
                 '    if (hasInvoices && hasDeposits) {' +
                 '        html += "<div class=\\"search-title\\" style=\\"margin-top: 15px; color: #dc3545;\\">⚠️ MIXED SCENARIO DETECTED</div>";' +
                 '        html += "<div class=\\"search-count\\" style=\\"background-color: #fff3cd; padding: 12px; border: 1px solid #ffc107; border-radius: 4px; margin-bottom: 15px;\\">";' +
@@ -3025,88 +3408,104 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '        html += "Accounting to combine the refunds for bank reconciliation.";' +
                 '        html += "</div>";' +
                 '        html += "</div>";' +
+                '    }' +
+                '    if (hasInvoices) {' +
                 '        html += "<div class=\\"search-title\\" style=\\"margin-top: 15px;\\">Paid Invoices</div>";' +
                 '        html += "<div class=\\"search-count\\">Results: " + invoices.length + "</div>";' +
                 '        html += buildInvoicesTable(invoices);' +
+                '    }' +
+                '    if (hasDeposits) {' +
                 '        html += "<div class=\\"search-title\\" style=\\"margin-top: 25px;\\">Unapplied Customer Deposits</div>";' +
                 '        html += "<div class=\\"search-count\\">Results: " + deposits.length + "</div>";' +
                 '        html += buildDepositsTable(deposits);' +
                 '    }' +
+                '    if (hasRefunds) {' +
+                '        html += "<div class=\\"search-title\\" style=\\"margin-top: 25px;\\">Customer Refunds - Duplicate Refund Creation</div>";' +
+                '        html += "<div class=\\"search-count\\">Results: " + refunds.length + "</div>";' +
+                '        html += buildRefundsTable(refunds);' +
+                '    }' +
                 '    document.getElementById("invoiceResults").innerHTML = html;' +
                 '}' +
-                // NEW: Build invoices table
                 'function buildInvoicesTable(invoices) {' +
                 '    var html = "<table class=\\"search-table\\">";' +
                 '    html += "<thead><tr><th>Action</th><th>Invoice #</th><th>Date</th><th>Amount</th><th>Memo</th></tr></thead><tbody>";' +
                 '    for (var i = 0; i < invoices.length; i++) {' +
                 '        var inv = invoices[i];' +
-                '        var dataId = "invoice_data_" + i;' +
                 '        html += "<tr>";' +
                 '        html += "<td class=\\"action-cell\\">";' +
-                '        html += "<div id=\\"" + dataId + "\\" class=\\"hidden-data\\">";' +
-                '        html += "<input type=\\"hidden\\" name=\\"action\\" value=\\"process\\">";' +
-                '        html += "<input type=\\"hidden\\" name=\\"invoiceId\\" value=\\"" + inv.id + "\\">";' +
-                '        html += "</div>";' +
-                '        var hasAnyChargeback = inv.hasDisputeChargeback || inv.hasFraudChargeback;' +
-                '        if (hasAnyChargeback) {' +
-                '            html += "<button type=\\"button\\" class=\\"action-btn chargeback-btn\\" disabled>Create Dispute Chargeback</button>";' +
-                '        } else {' +
-                '            html += "<button type=\\"button\\" class=\\"action-btn chargeback-btn\\" onclick=\\"processAction(\'" + dataId + "\', \'" + inv.id + "\', \'chargeback\')\\\">Create Dispute Chargeback</button>";' +
-                '        }' +
-                '        if (hasAnyChargeback) {' +
-                '            html += "<button type=\\"button\\" class=\\"action-btn fraud-btn\\" disabled>Create Fraud Chargeback</button>";' +
-                '        } else {' +
-                '            html += "<button type=\\"button\\" class=\\"action-btn fraud-btn\\" onclick=\\"processAction(\'" + dataId + "\', \'" + inv.id + "\', \'fraud\')\\\">Create Fraud Chargeback</button>";' +
-                '        }' +
-                '        html += "<button type=\\"button\\" class=\\"action-btn nsf-btn\\" onclick=\\"processAction(\'" + dataId + "\', \'" + inv.id + "\', \'nsf\')\\\">NSF Check</button>";' +
+                '        var hasDispute = inv.hasDisputeChargeback || false;' +
+                '        var hasFraud = inv.hasFraudChargeback || false;' +
+                '        var disabledClass = (hasDispute || hasFraud) ? " disabled" : "";' +
+                '        var disabledAttr = (hasDispute || hasFraud) ? " disabled" : "";' +
+                '        html += "<button type=\\"button\\" class=\\"action-btn chargeback-btn" + disabledClass + "\\"" + disabledAttr + " onclick=\\"processAction(\'chargeback_\' + inv.id, \'" + inv.id + "\', \'chargeback\')\\\">Process Dispute Chargeback</button>";' +
+                '        html += "<button type=\\"button\\" class=\\"action-btn fraud-btn" + disabledClass + "\\"" + disabledAttr + " onclick=\\"processAction(\'fraud_\' + inv.id, \'" + inv.id + "\', \'fraud\')\\\">Process Fraud Chargeback</button>";' +
+                '        html += "<button type=\\"button\\" class=\\"action-btn nsf-btn\\" onclick=\\"processAction(\'nsf_\' + inv.id, \'" + inv.id + "\', \'nsf\')\\\">Process NSF Check</button>";' +
                 '        html += "</td>";' +
                 '        html += "<td><a href=\\"/app/accounting/transactions/custinvc.nl?id=" + inv.id + "\\" target=\\"_blank\\">" + escapeHtmlClient(inv.tranid) + "</a></td>";' +
                 '        html += "<td>" + escapeHtmlClient(inv.date) + "</td>";' +
-                '        html += "<td>$" + parseFloat(inv.amount).toFixed(2) + "</td>";' +
+                '        html += "<td style=\\"font-weight: bold;\\">$" + parseFloat(inv.amount).toFixed(2) + "</td>";' +
                 '        html += "<td>" + escapeHtmlClient(inv.memo) + "</td>";' +
                 '        html += "</tr>";' +
                 '    }' +
                 '    html += "</tbody></table>";' +
                 '    return html;' +
                 '}' +
-                // NEW: Build deposits table
                 'function buildDepositsTable(deposits) {' +
                 '    var html = "<table class=\\"search-table\\">";' +
-                '    html += "<thead><tr><th>Action</th><th>Deposit #</th><th>Sales Order</th><th>Date</th><th>Unapplied Amount</th><th>Memo</th></tr></thead><tbody>";' +
+                '    html += "<thead><tr><th>Action</th><th>Deposit #</th><th>Date</th><th>Unapplied Amount</th><th>Sales Order</th><th>Memo</th></tr></thead><tbody>";' +
                 '    for (var i = 0; i < deposits.length; i++) {' +
                 '        var dep = deposits[i];' +
                 '        html += "<tr>";' +
                 '        html += "<td class=\\"action-cell\\">";' +
-                '        html += "<button type=\\"button\\" class=\\"action-btn chargeback-btn\\" onclick=\\"submitDepositRefund(\'" + dep.id + "\', \'chargeback\')\\\">Refund - Dispute</button>";' +
-                '        html += "<button type=\\"button\\" class=\\"action-btn fraud-btn\\" onclick=\\"submitDepositRefund(\'" + dep.id + "\', \'fraud\')\\\">Refund - Fraud</button>";' +
-                '        html += "<button type=\\"button\\" class=\\"action-btn nsf-btn\\" onclick=\\"submitDepositRefund(\'" + dep.id + "\', \'nsf\')\\\">Refund - NSF</button>";' +
+                '        html += "<button type=\\"button\\" class=\\"action-btn chargeback-btn\\" onclick=\\"submitDepositRefund(\'" + dep.id + "\', \'chargeback\')\\\">Create Dispute CD Refund</button>";' +
+                '        html += "<button type=\\"button\\" class=\\"action-btn fraud-btn\\" onclick=\\"submitDepositRefund(\'" + dep.id + "\', \'fraud\')\\\">Create Fraud CD Refund</button>";' +
+                '        html += "<button type=\\"button\\" class=\\"action-btn nsf-btn\\" onclick=\\"submitDepositRefund(\'" + dep.id + "\', \'nsf\')\\\">Create NSF CD Refund</button>";' +
                 '        html += "</td>";' +
                 '        html += "<td><a href=\\"/app/accounting/transactions/custdep.nl?id=" + dep.id + "\\" target=\\"_blank\\">" + escapeHtmlClient(dep.tranid) + "</a></td>";' +
+                '        html += "<td>" + escapeHtmlClient(dep.date) + "</td>";' +
+                '        html += "<td style=\\"font-weight: bold;\\">$" + parseFloat(dep.amountRemaining).toFixed(2) + "</td>";' +
                 '        html += "<td>";' +
-                '        if (dep.salesOrderId) {' +
+                '        if (dep.salesOrder && dep.salesOrderId) {' +
                 '            html += "<a href=\\"/app/accounting/transactions/salesord.nl?id=" + dep.salesOrderId + "\\" target=\\"_blank\\">" + escapeHtmlClient(dep.salesOrder) + "</a>";' +
                 '        } else {' +
-                '            html += "<em>No SO</em>";' +
+                '            html += "<em style=\\"color: #999;\\">No SO</em>";' +
                 '        }' +
                 '        html += "</td>";' +
-                '        html += "<td>" + escapeHtmlClient(dep.date) + "</td>";' +
-                '        html += "<td style=\\"font-weight: bold; color: #28a745;\\">$" + parseFloat(dep.amountRemaining).toFixed(2) + "</td>";' +
                 '        html += "<td>" + escapeHtmlClient(dep.memo) + "</td>";' +
                 '        html += "</tr>";' +
                 '    }' +
                 '    html += "</tbody></table>";' +
                 '    return html;' +
                 '}' +
-                // FIXED: Process deposit refund function - set correct form action
+                'function buildRefundsTable(refunds) {' +
+                '    var html = "<table class=\\"search-table\\">";' +
+                '    html += "<thead><tr><th>Action</th><th>Refund #</th><th>Date</th><th>Amount</th><th>Status</th><th>Memo</th></tr></thead><tbody>";' +
+                '    for (var i = 0; i < refunds.length; i++) {' +
+                '        var ref = refunds[i];' +
+                '        html += "<tr>";' +
+                '        html += "<td class=\\"action-cell\\">";' +
+                '        html += "<button type=\\"button\\" class=\\"action-btn chargeback-btn\\" onclick=\\"submitDuplicateRefund(\'" + ref.id + "\', \'freedompay\')\\\">Process Duplicate FreedomPay Refund</button>";' +
+                '        html += "<button type=\\"button\\" class=\\"action-btn fraud-btn\\" onclick=\\"submitDuplicateRefund(\'" + ref.id + "\', \'chargeback\')\\\">Process Duplicate Chargeback Refund</button>";' +
+                '        html += "</td>";' +
+                '        html += "<td><a href=\\"/app/accounting/transactions/custrfnd.nl?id=" + ref.id + "\\" target=\\"_blank\\">" + escapeHtmlClient(ref.tranid) + "</a></td>";' +
+                '        html += "<td>" + escapeHtmlClient(ref.date) + "</td>";' +
+                '        html += "<td style=\\"font-weight: bold;\\">$" + parseFloat(ref.amount).toFixed(2) + "</td>";' +
+                '        html += "<td>" + escapeHtmlClient(ref.status) + "</td>";' +
+                '        html += "<td>" + escapeHtmlClient(ref.memo) + "</td>";' +
+                '        html += "</tr>";' +
+                '    }' +
+                '    html += "</tbody></table>";' +
+                '    return html;' +
+                '}' +
                 'function submitDepositRefund(depositId, type) {' +
-                '    var typeText = type === "nsf" ? "NSF Check" : (type === "fraud" ? "Fraud" : "Dispute");' +
-                '    if (!confirm("Are you sure you want to process a " + typeText + " refund for this deposit?")) {' +
+                '    var typeText = type === "nsf" ? "NSF Check" : (type === "fraud" ? "Fraud Chargeback" : "Dispute Chargeback");' +
+                '    if (!confirm("Process " + typeText + " for this deposit?\\n\\nThis will create a customer refund from the unapplied deposit amount.")) {' +
                 '        return;' +
                 '    }' +
                 '    showLoading("Processing deposit refund...");' +
                 '    var form = document.createElement("form");' +
                 '    form.method = "POST";' +
-                '    form.action = "' + scriptUrl + '";' + // FIXED: Use scriptUrl variable
+                '    form.action = "' + scriptUrl + '";' +
                 '    var actionInput = document.createElement("input");' +
                 '    actionInput.type = "hidden";' +
                 '    actionInput.name = "action";' +
@@ -3117,6 +3516,41 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    depositInput.name = "depositId";' +
                 '    depositInput.value = depositId;' +
                 '    form.appendChild(depositInput);' +
+                '    var typeInput = document.createElement("input");' +
+                '    typeInput.type = "hidden";' +
+                '    typeInput.name = "type";' +
+                '    typeInput.value = type;' +
+                '    form.appendChild(typeInput);' +
+                '    document.body.appendChild(form);' +
+                '    form.submit();' +
+                '}' +
+                'function submitDuplicateRefund(refundId, type) {' +
+                '    var typeText = type === "freedompay" ? "Duplicate FreedomPay Refund in Error" : "Duplicate Chargeback Refund";' +
+                '    var confirmMsg = "⚠️ IMPORTANT WARNING ⚠️\\n\\n";' +
+                '    confirmMsg += "This process should ONLY be used when:\\n";' +
+                '    confirmMsg += "• There is NO appropriate invoice to refund\\n";' +
+                '    confirmMsg += "• There is NO unapplied customer deposit to refund\\n";' +
+                '    confirmMsg += "• A refund was already processed correctly AND\\n";' +
+                '    confirmMsg += "• That same refund was then processed AGAIN in error\\n\\n";' +
+                '    confirmMsg += "This creates records to track a duplicate refund that has no backing transaction.\\n\\n";' +
+                '    confirmMsg += "Do you understand and wish to proceed with creating a " + typeText + "?";' +
+                '    if (!confirm(confirmMsg)) {' +
+                '        return;' +
+                '    }' +
+                '    showLoading("Processing duplicate refund...");' +
+                '    var form = document.createElement("form");' +
+                '    form.method = "POST";' +
+                '    form.action = "' + scriptUrl + '";' +
+                '    var actionInput = document.createElement("input");' +
+                '    actionInput.type = "hidden";' +
+                '    actionInput.name = "action";' +
+                '    actionInput.value = "processDuplicateRefund";' +
+                '    form.appendChild(actionInput);' +
+                '    var refundInput = document.createElement("input");' +
+                '    refundInput.type = "hidden";' +
+                '    refundInput.name = "refundId";' +
+                '    refundInput.value = refundId;' +
+                '    form.appendChild(refundInput);' +
                 '    var typeInput = document.createElement("input");' +
                 '    typeInput.type = "hidden";' +
                 '    typeInput.name = "type";' +
