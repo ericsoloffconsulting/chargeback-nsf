@@ -610,21 +610,26 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-         * Handles AJAX request for paid invoices
-         * @param {Object} context
-         */
+  * Handles AJAX request for paid invoices AND unapplied deposits
+  * @param {Object} context
+  */
         function handlePaidInvoicesRequest(context) {
             var request = context.request;
             var response = context.response;
             var customerId = request.parameters.customerId;
 
-            log.debug('Paid Invoices Request', 'Customer ID: ' + customerId);
+            log.debug('Customer Transaction Request', 'Customer ID: ' + customerId);
 
             try {
                 var invoices = searchPaidInvoices(customerId);
-                response.write(JSON.stringify(invoices));
+                var deposits = searchUnappliedDeposits(customerId);
+
+                response.write(JSON.stringify({
+                    invoices: invoices,
+                    deposits: deposits
+                }));
             } catch (e) {
-                log.error('Paid Invoices Error', 'Error: ' + e.toString() + ' | Stack: ' + e.stack);
+                log.error('Transaction Search Error', 'Error: ' + e.toString() + ' | Stack: ' + e.stack);
                 response.write(JSON.stringify({ error: e.toString() }));
             }
         }
@@ -773,6 +778,146 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
+  * Searches for unapplied customer deposits for a specific customer
+  * FIXED: Use amountunapplied field instead of amountremaining
+  * @param {string} customerId - Customer internal ID
+  * @returns {Array} Array of deposit objects with unapplied amounts
+  */
+        /**
+  * Searches for unapplied customer deposits for a specific customer
+  * Uses transaction join to find applying transactions and calculate unapplied amounts
+  * @param {string} customerId - Customer internal ID
+  * @returns {Array} Array of deposit objects with unapplied amounts
+  */
+        function searchUnappliedDeposits(customerId) {
+            if (!customerId) {
+                log.debug('searchUnappliedDeposits', 'No customer ID provided');
+                return [];
+            }
+
+            log.debug('Searching Unapplied Deposits - START', 'Customer ID: ' + customerId);
+
+            // First, get all customer deposits for this customer
+            var depositSearch = search.create({
+                type: search.Type.CUSTOMER_DEPOSIT,
+                filters: [
+                    ['entity', 'anyof', customerId],
+                    'AND',
+                    ['mainline', 'is', 'T']
+                ],
+                columns: [
+                    search.createColumn({ name: 'internalid', sort: search.Sort.DESC }),
+                    search.createColumn({ name: 'tranid' }),
+                    search.createColumn({ name: 'trandate' }),
+                    search.createColumn({ name: 'amount' }),
+                    search.createColumn({ name: 'memo' }),
+                    search.createColumn({ name: 'status' }),
+                    search.createColumn({ name: 'salesorder' })
+                ]
+            });
+
+            var deposits = {};
+
+            depositSearch.run().each(function (res) {
+                var depositId = res.id;
+                var totalAmount = parseFloat(res.getValue('amount')) || 0;
+
+                deposits[depositId] = {
+                    id: depositId,
+                    tranid: res.getValue('tranid'),
+                    date: res.getValue('trandate'),
+                    totalAmount: totalAmount,
+                    appliedAmount: 0, // Will be calculated
+                    salesOrder: res.getText('salesorder') || '',
+                    salesOrderId: res.getValue('salesorder'),
+                    memo: res.getValue('memo') || '',
+                    status: res.getText('status')
+                };
+
+                return true;
+            });
+
+            log.debug('Customer Deposits Found', 'Count: ' + Object.keys(deposits).length);
+
+            if (Object.keys(deposits).length === 0) {
+                return [];
+            }
+
+            // Now search for applying transactions to these deposits
+            var applyingSearch = search.create({
+                type: search.Type.TRANSACTION,
+                filters: [
+                    ['appliedtotransaction.internalid', 'anyof', Object.keys(deposits)],
+                    'AND',
+                    ['mainline', 'is', 'T']
+                ],
+                columns: [
+                    search.createColumn({ name: 'internalid', join: 'appliedToTransaction' }),
+                    search.createColumn({ name: 'amount' })
+                ]
+            });
+
+            applyingSearch.run().each(function (res) {
+                var depositId = res.getValue({ name: 'internalid', join: 'appliedToTransaction' });
+                var appliedAmount = parseFloat(res.getValue('amount')) || 0;
+
+                if (deposits[depositId]) {
+                    deposits[depositId].appliedAmount += Math.abs(appliedAmount);
+                }
+
+                return true;
+            });
+
+            log.debug('Applied Amounts Calculated', 'Deposit count: ' + Object.keys(deposits).length);
+
+            // Build results array with only deposits that have unapplied amounts
+            var results = [];
+
+            for (var depositId in deposits) {
+                if (deposits.hasOwnProperty(depositId)) {
+                    var dep = deposits[depositId];
+                    var amountUnapplied = dep.totalAmount - dep.appliedAmount;
+
+                    log.debug('Deposit Calculation', {
+                        depositId: depositId,
+                        tranid: dep.tranid,
+                        totalAmount: dep.totalAmount,
+                        appliedAmount: dep.appliedAmount,
+                        amountUnapplied: amountUnapplied,
+                        status: dep.status
+                    });
+
+                    // Only include deposits with unapplied amounts > $0.01
+                    if (amountUnapplied > 0.01) {
+                        results.push({
+                            id: dep.id,
+                            tranid: dep.tranid,
+                            date: dep.date,
+                            amountRemaining: amountUnapplied,
+                            totalAmount: dep.totalAmount,
+                            salesOrder: dep.salesOrder,
+                            salesOrderId: dep.salesOrderId,
+                            memo: dep.memo,
+                            status: dep.status
+                        });
+                    }
+                }
+            }
+
+            log.debug('Unapplied Deposits Found (Final)', {
+                count: results.length,
+                sampleResult: results.length > 0 ? {
+                    tranid: results[0].tranid,
+                    amountUnapplied: results[0].amountRemaining,
+                    totalAmount: results[0].totalAmount,
+                    status: results[0].status
+                } : 'No results'
+            });
+
+            return results;
+        }
+
+        /**
   * Builds the main page HTML content
   * @param {Object} context - Request context
   * @returns {string} HTML content
@@ -840,13 +985,18 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 html += '</div>';
             }
 
+            // In buildPageHTML(), add after other success messages:
+            if (params.depositRefundSuccess === 'true') {
+                html += buildDepositRefundSuccessMessage(params);
+            }
+
             // Error message
             if (params.error) {
                 html += '<div class="error-msg">' + escapeHtml(decodeURIComponent(params.error)) + '</div>';
             }
 
             // Customer search section
-            html += '<div class="search-title">Search Customer Invoices</div>';
+            html += '<div class="search-title">Search Customer Transactions</div>';
             html += '<div class="search-container">';
             html += '<input type="text" id="customerSearch" placeholder="Search by customer name or ID..." style="width: 100%; padding: 8px; font-size: 14px; border: 1px solid #ddd; border-radius: 4px;" />';
             html += '<input type="hidden" id="selectedCustomerId" />';
@@ -864,6 +1014,27 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             html += '<div class="search-count">All customers with open chargeback or NSF check invoices</div>';
             html += buildGlobalTrackingTable();
 
+            html += '</div>';
+
+            return html;
+        }
+
+        function buildDepositRefundSuccessMessage(params) {
+            var type = params.type || 'chargeback';
+            var customer = decodeURIComponent(params.customer || 'Customer');
+            var refundId = params.refundId || '';
+            var refundTranId = params.refundTranId || refundId;  // UPDATED: Use tranid, fallback to ID
+            var depositId = params.depositId || '';
+            var depositTranId = params.depositTranId || depositId;  // UPDATED: Use tranid, fallback to ID
+            var amount = params.amount || '0.00';
+
+            var typeText = type === 'nsf' ? 'NSF Check' : (type === 'fraud' ? 'Fraud Chargeback' : 'Dispute Chargeback');
+
+            var html = '<div class="success-msg">';
+            html += '<strong>' + typeText + ' Deposit Refund Processed Successfully for ' + escapeHtml(customer) + '</strong><br>';
+            html += 'Customer Refund: <a href="/app/accounting/transactions/custrfnd.nl?id=' + refundId + '" target="_blank">' + escapeHtml(refundTranId) + '</a><br>';  // UPDATED: Show tranid
+            html += 'Original Deposit: <a href="/app/accounting/transactions/custdep.nl?id=' + depositId + '" target="_blank">' + escapeHtml(depositTranId) + '</a><br>';  // UPDATED: Show tranid
+            html += 'Amount Refunded: $' + parseFloat(amount).toFixed(2);
             html += '</div>';
 
             return html;
@@ -1549,10 +1720,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             return results;
         }
 
-        /**
-         * Handles POST requests - processes chargeback/NSF actions and file uploads
-         * @param {Object} context
-         */
         function handlePost(context) {
             var request = context.request;
             var params = request.parameters;
@@ -1561,19 +1728,17 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             log.audit('POST Request Received', 'Parameters: ' + JSON.stringify(params) + ' | Files: ' + JSON.stringify(Object.keys(files || {})));
 
             try {
-                // Check if this is a file upload by looking for the specific parameter
-                // The file should be in request.files with the exact field name
+                // Check if this is a file upload
                 var isFileUpload = params.custpage_invoice_id && params.custpage_dispute_file;
 
                 if (isFileUpload) {
-                    // This is a file upload - the file name is in parameters but content might be elsewhere
-                    log.debug('File Upload Detected', {
-                        hasInvoiceId: !!params.custpage_invoice_id,
-                        hasFileParam: !!params.custpage_dispute_file,
-                        fileParamValue: params.custpage_dispute_file
-                    });
-
                     handleFileUploadForm(context);
+                    return;
+                }
+
+                // NEW: Handle deposit refund processing
+                if (params.action === 'processDepositRefund') {
+                    handleDepositRefund(context);
                     return;
                 }
 
@@ -1616,6 +1781,197 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     }
                 });
             }
+        }
+
+        /**
+  * Handles deposit refund processing - creates customer refund from deposit
+  * @param {Object} context
+  */
+        function handleDepositRefund(context) {
+            var request = context.request;
+            var depositId = request.parameters.depositId;
+            var type = request.parameters.type;
+
+            log.audit('Deposit Refund Request', {
+                depositId: depositId,
+                type: type
+            });
+
+            try {
+                if (!depositId || !type) {
+                    throw new Error('Deposit ID and type are required');
+                }
+
+                var result = processDepositRefund(depositId, type);
+
+                redirect.toSuitelet({
+                    scriptId: runtime.getCurrentScript().id,
+                    deploymentId: runtime.getCurrentScript().deploymentId,
+                    parameters: {
+                        depositRefundSuccess: 'true',
+                        type: type,
+                        customer: encodeURIComponent(result.customerName),
+                        refundId: result.refundId,
+                        refundTranId: result.refundTranId,  // NEW: Add tranid
+                        depositId: depositId,
+                        depositTranId: result.depositTranId,  // NEW: Add tranid
+                        amount: result.amount
+                    }
+                });
+
+            } catch (e) {
+                log.error('Deposit Refund Error', {
+                    error: e.toString(),
+                    stack: e.stack,
+                    depositId: depositId,
+                    type: type
+                });
+
+                redirect.toSuitelet({
+                    scriptId: runtime.getCurrentScript().id,
+                    deploymentId: runtime.getCurrentScript().deploymentId,
+                    parameters: {
+                        error: encodeURIComponent('Deposit Refund Error: ' + e.toString())
+                    }
+                });
+            }
+        }
+
+        /**
+         * Processes deposit refund - creates customer refund applying to deposit
+         * @param {string} depositId - Customer Deposit internal ID
+         * @param {string} type - 'chargeback', 'fraud', or 'nsf'
+         * @returns {Object} Result with refund details
+         */
+        function processDepositRefund(depositId, type) {
+            log.audit('Processing Deposit Refund', {
+                depositId: depositId,
+                type: type
+            });
+
+            // Load the deposit
+            var depositRecord = record.load({
+                type: record.Type.CUSTOMER_DEPOSIT,
+                id: depositId,
+                isDynamic: false
+            });
+
+            var customerId = depositRecord.getValue('customer');
+            var customerName = depositRecord.getText('customer');
+            var tranId = depositRecord.getValue('tranid');
+            var amountToRefund = depositRecord.getValue('undepositedfunds') || depositRecord.getValue('payment');
+            var salesOrderId = depositRecord.getValue('salesorder');
+
+            log.debug('Deposit Loaded', {
+                depositId: depositId,
+                tranId: tranId,
+                customerId: customerId,
+                customerName: customerName,
+                amountToRefund: amountToRefund,
+                salesOrderId: salesOrderId
+            });
+
+            // Create customer refund
+            var customerRefund = record.create({
+                type: record.Type.CUSTOMER_REFUND,
+                isDynamic: true
+            });
+
+            customerRefund.setValue('customer', customerId);
+            customerRefund.setValue('paymentmethod', 15);
+
+            var memoText = type === 'nsf' ? 'NSF Check Deposit Refund' :
+                (type === 'fraud' ? 'Fraud Chargeback Deposit Refund' : 'Dispute Chargeback Deposit Refund');
+
+            customerRefund.setValue('memo', memoText);
+
+            var refundPrefix = type === 'nsf' ? 'NSF_CHECK_DEP' :
+                (type === 'fraud' ? 'FRAUD_CC_DEP' : 'CHARGEBACK_CC_DEP');
+            var customTranId = refundPrefix + '_' + tranId;
+
+            customerRefund.setValue('tranid', customTranId);
+
+            if (salesOrderId) {
+                try {
+                    customerRefund.setValue({
+                        fieldId: 'custbody_bas_refunded_transaction',
+                        value: salesOrderId
+                    });
+                    log.debug('Set Refunded Transaction Field', 'Sales Order ID: ' + salesOrderId);
+                } catch (e) {
+                    log.error('Error Setting Refunded Transaction', 'Error: ' + e.message);
+                }
+            } else {
+                log.audit('No Sales Order on Deposit', 'Deposit ID: ' + depositId + ' has no linked Sales Order - custbody_bas_refunded_transaction not set');
+            }
+
+            customerRefund.setValue('total', amountToRefund);
+
+            log.debug('Customer Refund Header Set', {
+                customer: customerId,
+                amount: amountToRefund,
+                tranId: customTranId,
+                refundedTransaction: salesOrderId || 'None'
+            });
+
+            // Find and apply the deposit
+            var depositLineCount = customerRefund.getLineCount({ sublistId: 'deposit' });
+            var depositApplied = false;
+
+            for (var i = 0; i < depositLineCount; i++) {
+                var depositDocId = customerRefund.getSublistValue({
+                    sublistId: 'deposit',
+                    fieldId: 'doc',
+                    line: i
+                });
+
+                if (depositDocId == depositId) {
+                    customerRefund.selectLine({
+                        sublistId: 'deposit',
+                        line: i
+                    });
+                    customerRefund.setCurrentSublistValue({
+                        sublistId: 'deposit',
+                        fieldId: 'apply',
+                        value: true
+                    });
+                    customerRefund.setCurrentSublistValue({
+                        sublistId: 'deposit',
+                        fieldId: 'amount',
+                        value: amountToRefund
+                    });
+                    customerRefund.commitLine({ sublistId: 'deposit' });
+                    depositApplied = true;
+                    log.debug('Applied to Deposit', {
+                        line: i,
+                        amount: amountToRefund
+                    });
+                    break;
+                }
+            }
+
+            if (!depositApplied) {
+                throw new Error('Could not find deposit in refund apply list');
+            }
+
+            var refundId = customerRefund.save();
+
+            log.audit('Deposit Refund Created', {
+                refundId: refundId,
+                refundTranId: customTranId,
+                depositId: depositId,
+                depositTranId: tranId,
+                amount: amountToRefund,
+                linkedSalesOrder: salesOrderId || 'None'
+            });
+
+            return {
+                refundId: refundId,
+                refundTranId: customTranId,  // NEW: Return tranid
+                depositTranId: tranId,       // NEW: Return deposit tranid
+                customerName: customerName,
+                amount: amountToRefund
+            };
         }
 
         /**
@@ -2579,31 +2935,108 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    loadPaidInvoices(id);' +
                 '}' +
                 'function loadPaidInvoices(customerId) {' +
-                '    console.log("Loading invoices for customer:", customerId);' +
-                '    document.getElementById("invoiceResults").innerHTML = "<div class=\\"search-count\\">Loading invoices...</div>";' +
+                '    console.log("Loading transactions for customer:", customerId);' +
+                '    document.getElementById("invoiceResults").innerHTML = "<div class=\\"search-count\\">Loading transactions...</div>";' +
                 '    var url = "' + scriptUrl + '&action=getPaidInvoices&customerId=" + customerId;' +
                 '    fetch(url)' +
                 '        .then(function(response) { return response.json(); })' +
                 '        .then(function(data) {' +
-                '            console.log("Invoices loaded:", data);' +
+                '            console.log("Transactions loaded:", data);' +
                 '            displayInvoices(data);' +
                 '        })' +
                 '        .catch(function(error) {' +
-                '            console.error("Invoice load error:", error);' +
-                '            document.getElementById("invoiceResults").innerHTML = "<div class=\\"error-msg\\">Error loading invoices: " + error + "</div>";' +
+                '            console.error("Transaction load error:", error);' +
+                '            document.getElementById("invoiceResults").innerHTML = "<div class=\\"error-msg\\">Error loading transactions: " + error + "</div>";' +
                 '        });' +
                 '}' +
-                'function displayInvoices(invoices) {' +
-                '    if (invoices.error) {' +
-                '        document.getElementById("invoiceResults").innerHTML = "<div class=\\"error-msg\\">Error: " + escapeHtmlClient(invoices.error) + "</div>";' +
+                // NEW: Smart scenario handler for invoices and deposits
+                'function displayInvoices(data) {' +
+                '    if (data.error) {' +
+                '        document.getElementById("invoiceResults").innerHTML = "<div class=\\"error-msg\\">Error: " + escapeHtmlClient(data.error) + "</div>";' +
                 '        return;' +
                 '    }' +
-                '    if (invoices.length === 0) {' +
-                '        document.getElementById("invoiceResults").innerHTML = "<div class=\\"search-count\\">No paid invoices found for this customer</div>";' +
+                '    var invoices = data.invoices || [];' +
+                '    var deposits = data.deposits || [];' +
+                '    var html = "";' +
+                '    var hasInvoices = invoices.length > 0;' +
+                '    var hasDeposits = deposits.length > 0;' +
+                '    if (!hasInvoices && !hasDeposits) {' +
+                '        document.getElementById("invoiceResults").innerHTML = "<div class=\\"search-count\\">No paid invoices or unapplied deposits found for this customer</div>";' +
                 '        return;' +
                 '    }' +
-                '    var html = "<div class=\\"search-count\\">Results: " + invoices.length + "</div>";' +
-                '    html += "<table class=\\"search-table\\">";' +
+                // SCENARIO 1: Only Invoices
+                '    if (hasInvoices && !hasDeposits) {' +
+                '        html += "<div class=\\"search-title\\" style=\\"margin-top: 15px;\\">Paid Invoices</div>";' +
+                '        html += "<div class=\\"search-count\\">Results: " + invoices.length + "</div>";' +
+                '        html += buildInvoicesTable(invoices);' +
+                '    }' +
+                // SCENARIO 2: Only Deposits
+                '    if (hasDeposits && !hasInvoices) {' +
+                '        html += "<div class=\\"search-title\\" style=\\"margin-top: 15px;\\">Unapplied Customer Deposits</div>";' +
+                '        html += "<div class=\\"search-count\\">Results: " + deposits.length + "</div>";' +
+                '        html += buildDepositsTable(deposits);' +
+                '    }' +
+                    /**
+                 * MIXED SCENARIO HANDLING METHODOLOGY
+                 * 
+                 * When a chargeback/NSF spans both invoiced amounts and unapplied customer deposits,
+                 * we intentionally process them separately rather than creating a single combined refund.
+                 * 
+                 * REASONING:
+                 * 1. NetSuite does not support partial linking of customer deposits to sales orders
+                 * 2. If we create a combined refund and link it to the SO:
+                 *    - The SO will show the FULL deposit amount as refunded (not just the unapplied portion)
+                 *    - This creates an inaccurate "overrefunded" appearance on the SO
+                 * 3. If we DON'T link the combined refund to the SO:
+                 *    - The SO won't show ANY refund against the deposit
+                 *    - This makes it appear the deposit was never refunded at all
+                 * 
+                 * SOLUTION - Process Separately:
+                 * 1. Process invoiced portion: Creates Credit Memo → Customer Refund (linked to CM)
+                 *    - Properly reflects A/R reversal for the invoiced amount
+                 * 2. Process deposit portion: Creates Customer Refund (linked to unapplied CD and SO)
+                 *    - Properly reflects only the unapplied deposit amount as refunded on the SO
+                 * 3. Both refunds hit "Undeposited Funds"
+                 * 4. Accounting combines them via Make Deposit to match bank records
+                 * 
+                 * This methodology provides:
+                 * - Accurate A/R reporting
+                 * - Accurate Sales Order balance due
+                 * - Accurate deposit refund tracking
+                 * - Clean bank reconciliation via combined Make Deposit
+                 */
+                // SCENARIO 3: HYBRID - Both
+                '    if (hasInvoices && hasDeposits) {' +
+                '        html += "<div class=\\"search-title\\" style=\\"margin-top: 15px; color: #dc3545;\\">⚠️ MIXED SCENARIO DETECTED</div>";' +
+                '        html += "<div class=\\"search-count\\" style=\\"background-color: #fff3cd; padding: 12px; border: 1px solid #ffc107; border-radius: 4px; margin-bottom: 15px;\\">";' +
+                '        html += "<strong style=\\"display: block; margin-bottom: 8px;\\">This customer has BOTH paid invoices and unapplied deposits.</strong>";' +
+                '        html += "<div style=\\"margin-bottom: 8px;\\">If your chargeback/NSF amount spans both:</div>";' +
+                '        html += "<ol style=\\"margin: 8px 0; padding-left: 20px;\\">";' +
+                '        html += "<li style=\\"margin-bottom: 6px;\\"><strong>Process the invoiced portion</strong> using the invoice chargeback/NSF process below<br>";' +
+                '        html += "<em style=\\"font-size: 11px; color: #666;\\">(Creates Credit Memo → Customer Refund → New Invoice)</em></li>";' +
+                '        html += "<li style=\\"margin-bottom: 6px;\\"><strong>Process the deposit portion</strong> using the deposit refund process below<br>";' +
+                '        html += "<em style=\\"font-size: 11px; color: #666;\\">(Creates Customer Refund from unapplied deposit)</em></li>";' +
+                '        html += "<li style=\\"margin-bottom: 6px;\\"><strong>Both refunds will hit Undeposited Funds</strong><br>";' +
+                '        html += "<em style=\\"font-size: 11px; color: #666;\\">(Accounting will combine via Make Deposit to match bank records)</em></li>";' +
+                '        html += "</ol>";' +
+                '        html += "<div style=\\"background-color: #e7f3ff; padding: 8px; border-left: 3px solid #2196F3; margin-top: 10px; font-size: 11px;\\">";' +
+                '        html += "<strong>Why process separately?</strong> NetSuite cannot partially link deposits to sales orders. ";' +
+                '        html += "Processing separately ensures accurate A/R reporting and accurate Sales Order balance due, while still allowing ";' +
+                '        html += "Accounting to combine the refunds for bank reconciliation.";' +
+                '        html += "</div>";' +
+                '        html += "</div>";' +
+                '        html += "<div class=\\"search-title\\" style=\\"margin-top: 15px;\\">Paid Invoices</div>";' +
+                '        html += "<div class=\\"search-count\\">Results: " + invoices.length + "</div>";' +
+                '        html += buildInvoicesTable(invoices);' +
+                '        html += "<div class=\\"search-title\\" style=\\"margin-top: 25px;\\">Unapplied Customer Deposits</div>";' +
+                '        html += "<div class=\\"search-count\\">Results: " + deposits.length + "</div>";' +
+                '        html += buildDepositsTable(deposits);' +
+                '    }' +
+                '    document.getElementById("invoiceResults").innerHTML = html;' +
+                '}' +
+                // NEW: Build invoices table
+                'function buildInvoicesTable(invoices) {' +
+                '    var html = "<table class=\\"search-table\\">";' +
                 '    html += "<thead><tr><th>Action</th><th>Invoice #</th><th>Date</th><th>Amount</th><th>Memo</th></tr></thead><tbody>";' +
                 '    for (var i = 0; i < invoices.length; i++) {' +
                 '        var inv = invoices[i];' +
@@ -2614,7 +3047,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '        html += "<input type=\\"hidden\\" name=\\"action\\" value=\\"process\\">";' +
                 '        html += "<input type=\\"hidden\\" name=\\"invoiceId\\" value=\\"" + inv.id + "\\">";' +
                 '        html += "</div>";' +
-                // UPDATED: Disable both Dispute and Fraud buttons if EITHER checkbox is checked
                 '        var hasAnyChargeback = inv.hasDisputeChargeback || inv.hasFraudChargeback;' +
                 '        if (hasAnyChargeback) {' +
                 '            html += "<button type=\\"button\\" class=\\"action-btn chargeback-btn\\" disabled>Create Dispute Chargeback</button>";' +
@@ -2626,7 +3058,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '        } else {' +
                 '            html += "<button type=\\"button\\" class=\\"action-btn fraud-btn\\" onclick=\\"processAction(\'" + dataId + "\', \'" + inv.id + "\', \'fraud\')\\\">Create Fraud Chargeback</button>";' +
                 '        }' +
-                // NSF button - always enabled
                 '        html += "<button type=\\"button\\" class=\\"action-btn nsf-btn\\" onclick=\\"processAction(\'" + dataId + "\', \'" + inv.id + "\', \'nsf\')\\\">NSF Check</button>";' +
                 '        html += "</td>";' +
                 '        html += "<td><a href=\\"/app/accounting/transactions/custinvc.nl?id=" + inv.id + "\\" target=\\"_blank\\">" + escapeHtmlClient(inv.tranid) + "</a></td>";' +
@@ -2636,7 +3067,63 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '        html += "</tr>";' +
                 '    }' +
                 '    html += "</tbody></table>";' +
-                '    document.getElementById("invoiceResults").innerHTML = html;' +
+                '    return html;' +
+                '}' +
+                // NEW: Build deposits table
+                'function buildDepositsTable(deposits) {' +
+                '    var html = "<table class=\\"search-table\\">";' +
+                '    html += "<thead><tr><th>Action</th><th>Deposit #</th><th>Sales Order</th><th>Date</th><th>Unapplied Amount</th><th>Memo</th></tr></thead><tbody>";' +
+                '    for (var i = 0; i < deposits.length; i++) {' +
+                '        var dep = deposits[i];' +
+                '        html += "<tr>";' +
+                '        html += "<td class=\\"action-cell\\">";' +
+                '        html += "<button type=\\"button\\" class=\\"action-btn chargeback-btn\\" onclick=\\"submitDepositRefund(\'" + dep.id + "\', \'chargeback\')\\\">Refund - Dispute</button>";' +
+                '        html += "<button type=\\"button\\" class=\\"action-btn fraud-btn\\" onclick=\\"submitDepositRefund(\'" + dep.id + "\', \'fraud\')\\\">Refund - Fraud</button>";' +
+                '        html += "<button type=\\"button\\" class=\\"action-btn nsf-btn\\" onclick=\\"submitDepositRefund(\'" + dep.id + "\', \'nsf\')\\\">Refund - NSF</button>";' +
+                '        html += "</td>";' +
+                '        html += "<td><a href=\\"/app/accounting/transactions/custdep.nl?id=" + dep.id + "\\" target=\\"_blank\\">" + escapeHtmlClient(dep.tranid) + "</a></td>";' +
+                '        html += "<td>";' +
+                '        if (dep.salesOrderId) {' +
+                '            html += "<a href=\\"/app/accounting/transactions/salesord.nl?id=" + dep.salesOrderId + "\\" target=\\"_blank\\">" + escapeHtmlClient(dep.salesOrder) + "</a>";' +
+                '        } else {' +
+                '            html += "<em>No SO</em>";' +
+                '        }' +
+                '        html += "</td>";' +
+                '        html += "<td>" + escapeHtmlClient(dep.date) + "</td>";' +
+                '        html += "<td style=\\"font-weight: bold; color: #28a745;\\">$" + parseFloat(dep.amountRemaining).toFixed(2) + "</td>";' +
+                '        html += "<td>" + escapeHtmlClient(dep.memo) + "</td>";' +
+                '        html += "</tr>";' +
+                '    }' +
+                '    html += "</tbody></table>";' +
+                '    return html;' +
+                '}' +
+                // FIXED: Process deposit refund function - set correct form action
+                'function submitDepositRefund(depositId, type) {' +
+                '    var typeText = type === "nsf" ? "NSF Check" : (type === "fraud" ? "Fraud" : "Dispute");' +
+                '    if (!confirm("Are you sure you want to process a " + typeText + " refund for this deposit?")) {' +
+                '        return;' +
+                '    }' +
+                '    showLoading("Processing deposit refund...");' +
+                '    var form = document.createElement("form");' +
+                '    form.method = "POST";' +
+                '    form.action = "' + scriptUrl + '";' + // FIXED: Use scriptUrl variable
+                '    var actionInput = document.createElement("input");' +
+                '    actionInput.type = "hidden";' +
+                '    actionInput.name = "action";' +
+                '    actionInput.value = "processDepositRefund";' +
+                '    form.appendChild(actionInput);' +
+                '    var depositInput = document.createElement("input");' +
+                '    depositInput.type = "hidden";' +
+                '    depositInput.name = "depositId";' +
+                '    depositInput.value = depositId;' +
+                '    form.appendChild(depositInput);' +
+                '    var typeInput = document.createElement("input");' +
+                '    typeInput.type = "hidden";' +
+                '    typeInput.name = "type";' +
+                '    typeInput.value = type;' +
+                '    form.appendChild(typeInput);' +
+                '    document.body.appendChild(form);' +
+                '    form.submit();' +
                 '}' +
                 'function markDisputeUploaded(invoiceId, tranId) {' +
                 '    var caseNumber = prompt("Enter Dispute Case Number (required):", "");' +
