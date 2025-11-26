@@ -4368,9 +4368,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             html += 'Customer Refund: <a href="/app/accounting/transactions/custrfnd.nl?id=' + refundId + '" target="_blank">' + escapeHtml(refundTranId) + '</a><br>';
             html += 'New Invoice: <a href="/app/accounting/transactions/custinvc.nl?id=' + newInvoiceId + '" target="_blank">' + escapeHtml(newInvoiceTranId) + '</a>';
 
-            if (type === 'fraud' && jeId) {
-                html += '<br>Journal Entry Write-Off: <a href="/app/accounting/transactions/journal.nl?id=' + jeId + '" target="_blank">' + escapeHtml(jeTranId) + '</a>';
-            }
+            // Note: Fraud chargebacks no longer automatically create JE write-offs
+            // Users must manually create the write-off using the "JE Write Off" button
 
             html += '</div>';
 
@@ -5598,168 +5597,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 customerName: customerName
             };
 
-            // Step 5: For fraud chargebacks, automatically create JE write-off
-            if (type === 'fraud') {
-                try {
-                    log.debug('Fraud Chargeback - Creating JE Write-Off', 'Invoice ID: ' + newInvoiceId);
-
-                    var amountDue = originalAmount; // Use original amount since new invoice was just created
-
-                    if (!department) {
-                        throw new Error('Invoice must have a department to create write-off journal entry');
-                    }
-
-                    // Create Journal Entry
-                    var journalEntry = record.create({
-                        type: record.Type.JOURNAL_ENTRY,
-                        isDynamic: true
-                    });
-
-                    // Set header fields
-                    journalEntry.setValue({
-                        fieldId: 'trandate',
-                        value: new Date()
-                    });
-
-                    if (subsidiary) {
-                        journalEntry.setValue({
-                            fieldId: 'subsidiary',
-                            value: subsidiary
-                        });
-                    }
-
-                    var jeMemoText = 'Fraud Chargeback Write-Off - Automated Journal Entry - See ' + newInvoiceTranId;
-                    journalEntry.setValue({
-                        fieldId: 'memo',
-                        value: jeMemoText
-                    });
-
-                    log.debug('JE Header Set', {
-                        subsidiary: subsidiary,
-                        memo: jeMemoText
-                    });
-
-                    // Line 1: Credit to Accounts Receivable (Account 119) with Customer
-                    journalEntry.selectNewLine({ sublistId: 'line' });
-
-                    journalEntry.setCurrentSublistValue({
-                        sublistId: 'line',
-                        fieldId: 'account',
-                        value: 119 // AR Account
-                    });
-
-                    journalEntry.setCurrentSublistValue({
-                        sublistId: 'line',
-                        fieldId: 'credit',
-                        value: amountDue
-                    });
-
-                    journalEntry.setCurrentSublistValue({
-                        sublistId: 'line',
-                        fieldId: 'entity',
-                        value: customerId
-                    });
-
-                    journalEntry.setCurrentSublistValue({
-                        sublistId: 'line',
-                        fieldId: 'memo',
-                        value: jeMemoText
-                    });
-
-                    journalEntry.commitLine({ sublistId: 'line' });
-
-                    log.debug('JE Line 1 Added', {
-                        account: 119,
-                        credit: amountDue,
-                        entity: customerId
-                    });
-
-                    // Line 2: Debit to COGS (Account 353) with Department
-                    journalEntry.selectNewLine({ sublistId: 'line' });
-
-                    journalEntry.setCurrentSublistValue({
-                        sublistId: 'line',
-                        fieldId: 'account',
-                        value: 353 // COGS Account
-                    });
-
-                    journalEntry.setCurrentSublistValue({
-                        sublistId: 'line',
-                        fieldId: 'debit',
-                        value: amountDue
-                    });
-
-                    journalEntry.setCurrentSublistValue({
-                        sublistId: 'line',
-                        fieldId: 'department',
-                        value: department
-                    });
-
-                    journalEntry.setCurrentSublistValue({
-                        sublistId: 'line',
-                        fieldId: 'memo',
-                        value: jeMemoText
-                    });
-
-                    journalEntry.commitLine({ sublistId: 'line' });
-
-                    log.debug('JE Line 2 Added', {
-                        account: 353,
-                        debit: amountDue,
-                        department: department
-                    });
-
-                    // Save the Journal Entry
-                    var jeId = journalEntry.save();
-
-                    log.audit('Journal Entry Created for Fraud', {
-                        jeId: jeId,
-                        newInvoiceId: newInvoiceId,
-                        amount: amountDue
-                    });
-
-                    // Get the JE tranid
-                    var jeRecord = record.load({
-                        type: record.Type.JOURNAL_ENTRY,
-                        id: jeId,
-                        isDynamic: false
-                    });
-                    var jeTranId = jeRecord.getValue('tranid');
-
-                    log.debug('JE Details', {
-                        jeId: jeId,
-                        jeTranId: jeTranId
-                    });
-
-                    // Apply the JE to the new invoice
-                    var applicationResult = applyJournalEntryToInvoice(newInvoiceId, jeId, amountDue, customerId);
-
-                    if (!applicationResult.success) {
-                        log.error('JE Application Warning', 'Journal Entry created but failed to apply to invoice: ' + applicationResult.error);
-                    } else {
-                        log.audit('JE Write-Off Complete for Fraud', {
-                            jeId: jeId,
-                            jeTranId: jeTranId,
-                            newInvoiceId: newInvoiceId,
-                            amount: amountDue,
-                            applied: applicationResult.success,
-                            paymentDeleted: applicationResult.paymentDeleted
-                        });
-                    }
-
-                    // Add JE info to result data
-                    resultData.jeId = jeId;
-                    resultData.jeTranId = jeTranId;
-
-                } catch (jeError) {
-                    log.error('Error Creating JE for Fraud Chargeback', {
-                        error: jeError.toString(),
-                        stack: jeError.stack,
-                        newInvoiceId: newInvoiceId
-                    });
-                    // Don't throw - the main chargeback process completed successfully
-                }
-            }
+            // NOTE: Fraud chargebacks no longer automatically create JE write-offs
+            // Users must manually create JE write-offs for fraud chargebacks using the "JE Write Off" button
+            // This matches the process for dispute chargebacks
 
             return resultData;
         }
