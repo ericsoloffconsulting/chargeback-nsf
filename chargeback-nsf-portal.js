@@ -1236,9 +1236,10 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
- * Builds the main page HTML content
- * UPDATED: Use proper file URL from NetSuite file object
- */
+   * Builds the main page HTML content
+   * UPDATED: Use proper file URL from NetSuite file object
+   * UPDATED: Moved SOP Quick Link inside suitelet container
+   */
         function buildPageHTML(context) {
             var params = context.request.parameters;
             var scriptUrl = runtime.getCurrentScript().deploymentId ?
@@ -1253,12 +1254,28 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '<div id="loadingText" class="loading-text">Processing...</div>' +
                 '</div>' +
                 '</div>';
+
             html += '<div class="chargeback-container">';
+
+            // MOVED: SOP Quick Link inside container, at the top right
+            html += '<div class="sop-link-container">';
+            html += '<a href="https://8289753.app.netsuite.com/app/site/hosting/scriptlet.nl?script=3923&deploy=1#11" target="_blank" class="sop-quick-link">';
+            html += '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 6px; vertical-align: middle;">';
+            html += '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>';
+            html += '<polyline points="14 2 14 8 20 8"></polyline>';
+            html += '<line x1="16" y1="13" x2="8" y2="13"></line>';
+            html += '<line x1="16" y1="17" x2="8" y2="17"></line>';
+            html += '<polyline points="10 9 9 9 8 9"></polyline>';
+            html += '</svg>';
+            html += '<span>SOP Quick Link</span>';
+            html += '</a>';
+            html += '</div>';
 
             // Success messages
             if (params.success === 'true') {
                 html += buildSuccessMessage(params);
             }
+
 
             if (params.reverseSuccess === 'true') {
                 html += buildReverseSuccessMessage(params);
@@ -5804,16 +5821,23 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-         * Returns CSS styles for the page
-         * UPDATED: Added styles for submission checklist
-         * @returns {string} CSS content
-         */
+  * Returns CSS styles for the page
+  * UPDATED: Added styles for submission checklist
+  * UPDATED: Repositioned SOP Quick Link within container
+  * @returns {string} CSS content
+  */
         function getStyles() {
             return '.uir-page-title-secondline { border: none !important; margin: 0 !important; padding: 0 !important; }' +
                 '.uir-record-type { border: none !important; }' +
                 '.bglt { border: none !important; }' +
                 '.smalltextnolink { border: none !important; }' +
-                '.chargeback-container { margin: 0; padding: 0; border: none; background: transparent; }' +
+                '.chargeback-container { margin: 0; padding: 20px; border: none; background: transparent; position: relative; }' +
+                // UPDATED: SOP Quick Link styles - absolute within container instead of fixed
+                '.sop-link-container { position: absolute; top: 0; right: 0; z-index: 100; }' +
+                '.sop-quick-link { display: inline-flex; align-items: center; padding: 10px 18px; background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%); color: white; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 13px; box-shadow: 0 4px 6px rgba(76, 175, 80, 0.3), 0 1px 3px rgba(0, 0, 0, 0.1); transition: all 0.3s ease; border: 2px solid rgba(255, 255, 255, 0.2); }' +
+                '.sop-quick-link:hover { background: linear-gradient(135deg, #45a049 0%, #4CAF50 100%); transform: translateY(-2px); box-shadow: 0 6px 12px rgba(76, 175, 80, 0.4), 0 2px 4px rgba(0, 0, 0, 0.15); text-decoration: none; color: white; border-color: rgba(255, 255, 255, 0.3); }' +
+                '.sop-quick-link:active { transform: translateY(0px); box-shadow: 0 2px 4px rgba(76, 175, 80, 0.3), 0 1px 2px rgba(0, 0, 0, 0.1); }' +
+                '.sop-quick-link svg { filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.2)); }' +
                 'table.search-table { border-collapse: collapse; width: 100%; margin: 15px 0; border: 1px solid #ddd; background: white; }' +
                 'table.search-table th, table.search-table td { border: 1px solid #ddd; padding: 8px; text-align: left; vertical-align: top; }' +
                 'table.search-table th { background-color: #f8f9fa; font-weight: bold; color: #333; font-size: 12px; }' +
