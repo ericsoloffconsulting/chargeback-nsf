@@ -3,7 +3,7 @@
  * @NScriptType Suitelet
  * @NModuleScope SameAccount
  */
-define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/runtime', 'N/email', 'N/url', 'N/render', 'N/file'],
+define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/runtime', 'N/email', 'N/url', 'N/render', 'N/file', 'N/encode', 'N/https'],
     /**
      * @param {serverWidget} serverWidget
      * @param {search} search
@@ -15,10 +15,11 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
      * @param {url} url
      * @param {render} render
      * @param {file} file
+     * @param {encode} encode
+     * @param {https} https
      */
-    function (serverWidget, search, record, redirect, log, runtime, email, url, render, file) {
 
-
+    function (serverWidget, search, record, redirect, log, runtime, email, url, render, file, encode, https) {
         /**
          * Handles GET and POST requests to the Suitelet
          * @param {Object} context - NetSuite context object containing request/response
@@ -96,6 +97,12 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 return;
             }
 
+            // Handle load customer transactions for PDF generation
+            if (request.parameters.action === 'loadCustomerTransactions') {
+                handleLoadCustomerTransactions(context);
+                return;
+            }
+
             // Create NetSuite form
             var form = serverWidget.createForm({
                 title: 'Chargeback, NSF Check and Duplicate Refund Processing'
@@ -134,10 +141,63 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-         * NEW: Handles creating a Chargeback Response custom record
-         * UPDATED: Set initial status to Pending Completion
-         * @param {Object} context
-         */
+ * NEW: Handles AJAX request to load customer transactions for PDF generation
+ * @param {Object} context
+ */
+        function handleLoadCustomerTransactions(context) {
+            var request = context.request;
+            var response = context.response;
+            var invoiceId = request.parameters.invoiceId;
+
+            log.debug('Load Customer Transactions Request', {
+                invoiceId: invoiceId
+            });
+
+            try {
+                if (!invoiceId) {
+                    throw new Error('Invoice ID is required');
+                }
+
+                // Load invoice to get customer
+                var invoiceRecord = record.load({
+                    type: record.Type.INVOICE,
+                    id: invoiceId,
+                    isDynamic: false
+                });
+
+                var customerId = invoiceRecord.getValue('entity');
+
+                log.debug('Customer Retrieved from Invoice', {
+                    invoiceId: invoiceId,
+                    customerId: customerId
+                });
+
+                // Search for transactions
+                var transactions = searchCustomerTransactionsForPDF(customerId);
+
+                response.write(JSON.stringify({
+                    success: true,
+                    transactions: transactions
+                }));
+
+            } catch (e) {
+                log.error('Load Customer Transactions Error', {
+                    error: e.toString(),
+                    stack: e.stack,
+                    invoiceId: invoiceId
+                });
+                response.write(JSON.stringify({
+                    success: false,
+                    error: e.toString()
+                }));
+            }
+        }
+
+        /**
+  * NEW: Handles creating a Chargeback Response custom record
+  * UPDATED: Set initial status to Pending Completion AND set Return Policy checkbox to true
+  * @param {Object} context
+  */
         function handleCreateResponseRecord(context) {
             var request = context.request;
             var invoiceId = request.parameters.invoiceId;
@@ -194,6 +254,12 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     value: '1' // Pending Completion
                 });
 
+                // NEW: Set Return Policy checkbox to true by default
+                responseRecord.setValue({
+                    fieldId: 'custrecord_bray_scarff_return_policy_doc',
+                    value: true
+                });
+
                 var responseRecordId = responseRecord.save();
 
                 log.audit('Chargeback Response Record Created', {
@@ -201,7 +267,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     invoiceId: invoiceId,
                     tranId: tranId,
                     customerId: customerId,
-                    initialStatus: 'Pending Completion'
+                    initialStatus: 'Pending Completion',
+                    returnPolicyChecked: true
                 });
 
                 // Redirect back to the Suitelet
@@ -800,6 +867,92 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
+  * NEW: Searches for customer transactions for PDF generation
+  * UPDATED: Sort oldest to newest, include chargeback checkbox fields
+  * UPDATED: Only show Sales Orders, Invoices, and Credit Memos
+  * @param {string} customerId - Customer internal ID
+  * @returns {Array} Array of transaction objects
+  */
+        function searchCustomerTransactionsForPDF(customerId) {
+            if (!customerId) {
+                return [];
+            }
+
+            log.debug('Searching Customer Transactions for PDF', {
+                customerId: customerId,
+                types: ['Sales Order', 'Invoice', 'Credit Memo'],
+                limits: 'No date or count limits',
+                sorting: 'Oldest to Newest'
+            });
+
+            var transactionSearch = search.create({
+                type: search.Type.TRANSACTION,
+                filters: [
+                    ['entity', 'anyof', customerId],
+                    'AND',
+                    ['mainline', 'is', 'T'],
+                    'AND',
+                    ['type', 'anyof', ['SalesOrd', 'CustInvc', 'CustCred']]
+                ],
+                columns: [
+                    search.createColumn({ name: 'tranid', sort: search.Sort.ASC }), // CHANGED: Sort oldest to newest
+                    search.createColumn({ name: 'trandate', sort: search.Sort.ASC }), // CHANGED: Also sort by date ascending
+                    search.createColumn({ name: 'type' }),
+                    search.createColumn({ name: 'amount' }),
+                    search.createColumn({ name: 'status' }),
+                    search.createColumn({ name: 'memo' }),
+                    search.createColumn({ name: 'custbody_bas_cc_dispute' }), // NEW: Credit card dispute checkbox
+                    search.createColumn({ name: 'custbody_bas_fraud' }) // NEW: Fraud checkbox
+                ]
+            });
+
+            var results = [];
+
+            transactionSearch.run().each(function (result) {
+                var transType = result.getValue('type');
+                var typeLabel = result.getText('type');
+
+                // NEW: Get checkbox values
+                var ccDisputeValue = result.getValue('custbody_bas_cc_dispute');
+                var fraudValue = result.getValue('custbody_bas_fraud');
+
+                // Convert to boolean
+                var hasCCDispute = ccDisputeValue === 'T' || ccDisputeValue === true;
+                var hasFraud = fraudValue === 'T' || fraudValue === true;
+
+                results.push({
+                    id: result.id,
+                    tranid: result.getValue('tranid'),
+                    date: result.getValue('trandate'),
+                    type: transType,
+                    typeLabel: typeLabel,
+                    amount: result.getValue('amount'),
+                    status: result.getText('status'),
+                    memo: result.getValue('memo') || '',
+                    hasCCDispute: hasCCDispute, // NEW
+                    hasFraud: hasFraud // NEW
+                });
+
+                return true;
+            });
+
+            log.debug('Customer Transactions Found for PDF', {
+                customerId: customerId,
+                count: results.length,
+                sampleTypes: results.slice(0, 3).map(function (r) {
+                    return {
+                        type: r.typeLabel,
+                        tranid: r.tranid,
+                        hasCCDispute: r.hasCCDispute,
+                        hasFraud: r.hasFraud
+                    };
+                })
+            });
+
+            return results;
+        }
+
+        /**
          * Handles AJAX customer search requests
          * @param {Object} context
          */
@@ -1083,9 +1236,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-  * Builds the main page HTML content
-  * UPDATED: Enhanced success message for dispute form saved with file count
-  */
+ * Builds the main page HTML content
+ * UPDATED: Use proper file URL from NetSuite file object
+ */
         function buildPageHTML(context) {
             var params = context.request.parameters;
             var scriptUrl = runtime.getCurrentScript().deploymentId ?
@@ -1125,11 +1278,14 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 html += '</div>';
             }
 
-            // UPDATED: Dispute form saved success message with file count
+            // UPDATED: Use proper file URL from NetSuite
             if (params.disputeFormSaved === 'true') {
                 var responseRecordId = params.responseRecordId || '';
                 var filesProcessed = parseInt(params.filesProcessed || '0', 10);
                 var fileErrors = parseInt(params.fileErrors || '0', 10);
+                var mergedPDFCreated = params.mergedPDFCreated === 'true';
+                var mergedFileName = decodeURIComponent(params.mergedFileName || '');
+                var mergedFileId = params.mergedFileId || '';
 
                 html += '<div class="success-msg">';
                 html += '<strong>Dispute Form Saved Successfully</strong><br>';
@@ -1138,6 +1294,48 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
                 if (filesProcessed > 0) {
                     html += '<br><strong>' + filesProcessed + ' file(s) uploaded successfully</strong>';
+                }
+
+                if (mergedPDFCreated && mergedFileName && mergedFileId) {
+                    // UPDATED: Load the file to get the proper URL with hash
+                    try {
+                        var mergedFile = file.load({ id: mergedFileId });
+                        var fileUrl = mergedFile.url;
+
+                        // Make sure the URL is absolute
+                        if (fileUrl && fileUrl.indexOf('http') !== 0) {
+                            fileUrl = 'https://' + runtime.accountId + '.app.netsuite.com' + fileUrl;
+                        }
+
+                        log.debug('Merged PDF URL Retrieved', {
+                            fileId: mergedFileId,
+                            fileName: mergedFileName,
+                            fileUrl: fileUrl
+                        });
+
+                        html += '<br><strong>✓ Merged PDF Created:</strong> ';
+                        html += '<a href="' + fileUrl + '" target="_blank" style="color: #0066cc; font-weight: bold;">' + escapeHtml(mergedFileName) + '</a>';
+
+                        // Auto-download script using the proper URL
+                        html += '<script>';
+                        html += 'setTimeout(function() {';
+                        html += '    var link = document.createElement("a");';
+                        html += '    link.href = "' + fileUrl + '";';
+                        html += '    link.download = "' + escapeHtml(mergedFileName) + '";';
+                        html += '    link.target = "_blank";';
+                        html += '    document.body.appendChild(link);';
+                        html += '    link.click();';
+                        html += '    document.body.removeChild(link);';
+                        html += '}, 500);';
+                        html += '</script>';
+                    } catch (fileLoadError) {
+                        log.error('Error Loading Merged File for URL', {
+                            error: fileLoadError.toString(),
+                            fileId: mergedFileId
+                        });
+                        // Fallback to simple display without link
+                        html += '<br><strong>✓ Merged PDF Created:</strong> ' + escapeHtml(mergedFileName);
+                    }
                 }
 
                 if (fileErrors > 0) {
@@ -1215,6 +1413,18 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             html += '</div>';
 
             return html;
+        }
+
+        /**
+ * NEW: Generates a simple hash for file download URL (NetSuite requires this)
+ * @param {string} fileId - File internal ID
+ * @returns {string} Hash value for download URL
+ */
+        function getFileDownloadHash(fileId) {
+            // NetSuite's file download URL requires a hash parameter
+            // This is a simplified version - the actual hash is generated by NetSuite
+            // For direct file downloads, we can use the file.url property instead
+            return fileId; // Placeholder - will use file.url in actual implementation
         }
 
         /**
@@ -1522,8 +1732,288 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
+ * Merges all files attached to a response record into a single PDF using PDF.co API
+ * 
+ * Creates a combined PDF document from all files attached to a chargeback response record.
+ * The function:
+ * 1. Retrieves all attached files from the response record
+ * 2. Makes files temporarily public for PDF.co to access
+ * 3. Calls PDF.co /pdf/merge2 endpoint to merge files (auto-converts non-PDFs)
+ * 4. Downloads the merged PDF and saves it to NetSuite File Cabinet
+ * 5. Attaches the merged PDF back to the response record
+ * 
+ * Filename format: DISPUTE_SUBMISSION_[CustomerID]_[CustomerName].pdf
+ * 
+ * @param {string} responseRecordId - Internal ID of the chargeback response custom record
+ * @param {string} invoiceTranId - Transaction ID of the related invoice (used for logging only)
+ * @returns {Object} Result object with the following properties:
+ * @returns {boolean} returns.success - Whether the merge operation succeeded
+ * @returns {string} [returns.mergedFileId] - Internal ID of the created merged PDF file (if successful)
+ * @returns {string} [returns.mergedFileName] - Name of the created merged PDF file (if successful)
+ * @returns {number} [returns.originalFileCount] - Number of files that were merged (if successful)
+ * @returns {string} [returns.error] - Error message (if unsuccessful)
+ * @returns {string} [returns.message] - Informational message (e.g., "No files to merge")
+ * 
+ * @throws Does not throw - returns error object instead
+ * 
+ * @requires N/record - For loading response and customer records
+ * @requires N/file - For file operations
+ * @requires N/https - For PDF.co API calls
+ * @requires N/runtime - For script parameters (API key)
+ * @requires Script Parameter: custscript_pdfco_api_key - PDF.co API key
+ * 
+ * @example
+ * var result = mergeAttachedFilesIntoPDF('12345', 'INV-2024-001');
+ * if (result.success) {
+ *     log.audit('PDF Merged', 'File ID: ' + result.mergedFileId);
+ * } else {
+ *     log.error('Merge Failed', result.error);
+ * }
+ */
+
+        function mergeAttachedFilesIntoPDF(responseRecordId, invoiceTranId) {
+            try {
+                log.debug('Merging Attached Files into PDF using PDF.co', {
+                    responseRecordId: responseRecordId,
+                    invoiceTranId: invoiceTranId
+                });
+
+                // Get script parameter for PDF.co API key
+                var script = runtime.getCurrentScript();
+                var API_KEY = script.getParameter({
+                    name: 'custscript_pdfco_api_key'
+                });
+
+                if (!API_KEY) {
+                    log.error('Missing PDF.co API Key parameter');
+                    return {
+                        success: false,
+                        error: 'PDF.co API Key parameter not configured'
+                    };
+                }
+
+                // Get all attached files
+                var attachedFiles = searchFilesAttachedToRecord(responseRecordId);
+
+                if (attachedFiles.length === 0) {
+                    log.debug('No files to merge');
+                    return { success: false, message: 'No files to merge' };
+                }
+
+                log.debug('Files to merge', {
+                    count: attachedFiles.length,
+                    files: attachedFiles.map(function (f) { return f.name; })
+                });
+
+                // NEW: Load response record to get customer info
+                var responseRecord = record.load({
+                    type: 'customrecord_chargeback_response',
+                    id: responseRecordId,
+                    isDynamic: false
+                });
+
+                var customerId = responseRecord.getValue('custrecord_customer');
+
+                // Load customer record to get customer name
+                var customerRecord = record.load({
+                    type: record.Type.CUSTOMER,
+                    id: customerId,
+                    isDynamic: false
+                });
+
+                var customerEntityId = customerRecord.getValue('entityid');
+                var customerName = customerRecord.getValue('companyname') || customerRecord.getValue('altname') || customerEntityId;
+
+                // Clean customer name for filename (remove special characters)
+                var cleanCustomerName = customerName.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 50);
+
+                log.debug('Customer Info Retrieved', {
+                    customerId: customerId,
+                    customerEntityId: customerEntityId,
+                    customerName: customerName,
+                    cleanCustomerName: cleanCustomerName
+                });
+
+                // Prepare file URLs for PDF.co API
+                var fileUrls = [];
+                for (var i = 0; i < attachedFiles.length; i++) {
+                    var fileObj = file.load({
+                        id: attachedFiles[i].id
+                    });
+
+                    // Make file public temporarily for PDF.co to access
+                    fileObj.isOnline = true;
+                    var publicFileId = fileObj.save();
+
+                    // Reload to get public URL
+                    var publicFile = file.load({
+                        id: publicFileId
+                    });
+
+                    var publicUrl = publicFile.url;
+                    if (publicUrl && publicUrl.indexOf('http') !== 0) {
+                        publicUrl = 'https://system.netsuite.com' + publicUrl;
+                    }
+
+                    fileUrls.push(publicUrl);
+
+                    log.debug('File made public for merging', {
+                        fileId: attachedFiles[i].id,
+                        fileName: fileObj.name,
+                        publicUrl: publicUrl
+                    });
+                }
+
+                // UPDATED: New filename format with customer ID and name
+                var mergedFileName = 'DISPUTE_SUBMISSION_' + customerEntityId + '_' + cleanCustomerName + '.pdf';
+
+                var jsonPayload = JSON.stringify({
+                    url: fileUrls.join(','),
+                    name: mergedFileName,
+                    async: false
+                });
+
+                var response = https.post({
+                    url: 'https://api.pdf.co/v1/pdf/merge2',
+                    body: jsonPayload,
+                    headers: {
+                        'x-api-key': API_KEY,
+                        'Content-Type': 'application/json'
+                    }
+                });
+
+                log.debug('PDF.co API Response', {
+                    statusCode: response.code,
+                    responseBody: response.body
+                });
+
+                if (response.code === 200) {
+                    var data = JSON.parse(response.body);
+
+                    if (data.error == false) {
+                        log.debug('PDF merge successful', {
+                            mergedPdfUrl: data.url,
+                            originalFileCount: attachedFiles.length,
+                            newFileName: mergedFileName
+                        });
+
+                        // Download merged PDF from PDF.co
+                        var mergedPdfResponse = https.get({
+                            url: data.url
+                        });
+
+                        if (mergedPdfResponse.code === 200) {
+                            // Save merged PDF to NetSuite
+                            var mergedFileObj = file.create({
+                                name: mergedFileName,
+                                fileType: file.Type.PDF,
+                                contents: mergedPdfResponse.body,
+                                folder: 2762649,
+                                description: 'Merged dispute files for Response Record #' + responseRecordId + ' - Customer: ' + customerName
+                            });
+
+                            var mergedFileId = mergedFileObj.save();
+
+                            log.debug('Merged PDF saved to NetSuite', {
+                                fileId: mergedFileId,
+                                fileName: mergedFileName
+                            });
+
+                            // Attach merged PDF to response record
+                            record.attach({
+                                record: { type: 'file', id: mergedFileId },
+                                to: { type: 'customrecord_chargeback_response', id: responseRecordId }
+                            });
+
+                            log.audit('Merged PDF Attached to Response Record', {
+                                mergedFileId: mergedFileId,
+                                mergedFileName: mergedFileName,
+                                responseRecordId: responseRecordId,
+                                originalFileCount: attachedFiles.length,
+                                customerId: customerId,
+                                customerName: customerName
+                            });
+
+                            return {
+                                success: true,
+                                mergedFileId: mergedFileId,
+                                mergedFileName: mergedFileName,
+                                originalFileCount: attachedFiles.length
+                            };
+                        } else {
+                            log.error('Failed to download merged PDF from PDF.co', {
+                                statusCode: mergedPdfResponse.code,
+                                url: data.url
+                            });
+                            return {
+                                success: false,
+                                error: 'Failed to download merged PDF: HTTP ' + mergedPdfResponse.code
+                            };
+                        }
+                    } else {
+                        log.error('PDF.co merge error', {
+                            error: data.message
+                        });
+                        return {
+                            success: false,
+                            error: data.message
+                        };
+                    }
+                } else {
+                    log.error('PDF.co API request failed', {
+                        statusCode: response.code,
+                        responseBody: response.body
+                    });
+                    return {
+                        success: false,
+                        error: 'HTTP ' + response.code
+                    };
+                }
+
+            } catch (e) {
+                log.error('Error Merging Files into PDF', {
+                    error: e.toString(),
+                    stack: e.stack,
+                    responseRecordId: responseRecordId,
+                    message: e.message
+                });
+                return {
+                    success: false,
+                    error: e.toString()
+                };
+            }
+        }
+
+        /**
+         * Helper function to get MIME type for image embedding
+         * @param {string} fileType - NetSuite file type constant
+         * @returns {string} MIME type
+         */
+        function getImageMimeType(fileType) {
+            if (fileType === file.Type.PNGIMAGE) return 'png';
+            if (fileType === file.Type.JPGIMAGE) return 'jpeg';
+            if (fileType === file.Type.GIFIMAGE) return 'gif';
+            return 'png'; // default
+        }
+
+        /**
+  * Helper function to escape XML special characters
+  * @param {string} text - Text to escape
+  * @returns {string} Escaped text
+  */
+        function escapeXml(text) {
+            if (!text) return '';
+            return text.toString()
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&apos;');
+        }
+
+        /**
   * Builds the submission checklist row for a dispute
-  * UPDATED: Don't auto-expand after disputeFormSaved - only after responseCreated
+  * UPDATED: Reorganized File Attachments section with consistent formatting
   * @param {string} invoiceId - Invoice internal ID
   * @param {string} responseRecordId - Response record internal ID
   * @param {Object} params - URL parameters
@@ -1546,6 +2036,10 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 var caseNumber = responseRecord.getValue('custrecord_case_number') || '';
                 var coverLetter = responseRecord.getValue('custrecord_cover_letter') || '';
 
+                // NEW: Get count of already attached files
+                var attachedFiles = searchFilesAttachedToRecord(responseRecordId);
+                var existingFileCount = attachedFiles.length;
+
                 // Get checkbox states
                 var r01eChecked = responseRecord.getValue('custrecord_dispute_notification_from_com');
                 var netsuiteTransChecked = responseRecord.getValue('custrecord_all_relevant_netsuite_transac');
@@ -1553,17 +2047,18 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 var deliveryPhotosChecked = responseRecord.getValue('custrecord_delivery_pictures_from_dispat');
                 var correspondenceChecked = responseRecord.getValue('custrecord_correspondence_from_sales');
 
-                // UPDATED: Only auto-expand when response is first created, NOT after saving dispute form
                 var shouldExpand = (params.responseCreated === 'true') && params.responseRecordId === responseRecordId;
                 var displayStyle = shouldExpand ? 'table-row' : 'none';
 
                 var html = '<tr class="checklist-row" id="checklist-' + invoiceId + '" style="display: ' + displayStyle + ';">';
                 html += '<td colspan="9" style="background-color: #f8f9fa; padding: 20px;">';
                 html += '<div style="border: 2px solid #4CAF50; border-radius: 8px; padding: 20px; background-color: white;">';
-                html += '<h3 style="margin-top: 0; color: #4CAF50; border-bottom: 2px solid #4CAF50; padding-bottom: 10px;">Dispute Submission Checklist</h3>';
 
-                // Add scroll target div at the top
+                // NEW: Add hidden input to store existing file count for JavaScript validation
+                html += '<input type="hidden" id="existing-file-count-' + invoiceId + '" value="' + existingFileCount + '" />';
+
                 html += '<div id="checklist-scroll-target-' + invoiceId + '"></div>';
+                html += '<h3 style="margin-top: 0; color: #4CAF50; border-bottom: 2px solid #4CAF50; padding-bottom: 10px;">Dispute Submission Checklist</h3>';
 
                 html += '<div id="checklist-form-' + invoiceId + '" style="display: grid; gap: 20px;">';
 
@@ -1585,7 +2080,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 html += '<div class="form-field">';
                 html += '<label for="cover-letter-' + invoiceId + '" style="display: block; font-weight: bold; margin-bottom: 5px;">';
                 html += '<span style="color: #dc3545;">* </span>Description for Cover Letter ';
-                html += '<span style="color: #666; font-weight: normal; font-size: 11px; font-style: italic;">(Describe official dispute response for inclusion in cover letter)</span>';
+                html += '<span style="color: #666; font-weight: normal; font-size: 11px; font-style: italic;">(Describe the facts as to why this dispute should be reversed. Examples: Full refund was already issue. Customer agreed to a monetary settlement that was already issued. Customer still has the disputed item in their posession. Customer claims "fraud" but has the items delivered to their address.)</span>';
                 html += '</label>';
                 html += '<textarea id="cover-letter-' + invoiceId + '" rows="4" required ';
                 html += 'style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-family: inherit;">' + escapeHtml(coverLetter) + '</textarea>';
@@ -1594,17 +2089,29 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 html += '</div>';
 
                 // ============================================================================
-                // SECTION 2: FILE ATTACHMENTS (MIDDLE) - PHASE 3: Multi-file queue
+                // SECTION 2: FILE ATTACHMENTS (MIDDLE) - REORGANIZED WITH CONSISTENT FORMATTING
                 // ============================================================================
                 html += '<div id="file-upload-section-' + invoiceId + '" style="background-color: #e7f3ff; padding: 15px; border-radius: 4px; border: 1px solid #2196F3;">';
                 html += '<h4 style="margin-top: 0; color: #333;">File Attachments <span style="color: #dc3545;">*</span></h4>';
+
+                // ===== SUBSECTION 1: Attach NetSuite Transaction PDFs =====
+                html += '<div style="background-color: #fff; padding: 12px; border-radius: 4px; border: 1px solid #00a6deff; margin-bottom: 15px;">';
+                html += '<h5 style="margin: 0 0 8px 0; color: #333; font-size: 13px; font-weight: bold;">Attach NetSuite Transaction PDFs</h5>';
                 html += '<div style="margin-bottom: 10px; font-size: 12px; color: #666;">';
-                html += '<strong>Instructions:</strong> Select one or more files to add to the queue. ';
-                html += 'You can add files multiple times. When ready, click "Save Dispute Form" to upload all files and save the form. ';
-                html += '<strong style="color: #dc3545;">At least 1 file is required.</strong>';
+                html += 'Click "Load Transactions" to attach relevant NetSuite transaction PDFs.';
+                html += '</div>';
+                html += '<button type="button" class="action-btn" style="background-color: #00a6deff; margin-bottom: 10px;" ';
+                html += 'onclick="loadCustomerTransactions(\'' + invoiceId + '\', \'' + responseRecordId + '\')">Load Transactions</button>';
+                html += '<div id="transaction-list-' + invoiceId + '" style="display: none; margin-top: 10px; max-height: 250px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px; background: #fafafa;"></div>';
                 html += '</div>';
 
-                // PHASE 3: Multi-file input with queue display
+                // ===== SUBSECTION 2: Attach Manual Files =====
+                html += '<div style="background-color: #fff; padding: 12px; border-radius: 4px; border: 1px solid #00a6deff; margin-bottom: 15px;">';
+                html += '<h5 style="margin: 0 0 8px 0; color: #333; font-size: 13px; font-weight: bold;">Attach Manual Files</h5>';
+                html += '<div style="margin-bottom: 10px; font-size: 12px; color: #666;">';
+                html += 'Choose files, click "Add to Queue". Queue as many as needed. See the "Requirements Checklist" for required file attachments.';
+                html += '</div>';
+
                 html += '<div style="display: flex; gap: 10px; align-items: center; margin-bottom: 15px;">';
                 html += '<input type="file" id="multi-file-input-' + invoiceId + '" multiple ';
                 html += 'style="flex: 1; padding: 8px; border: 1px solid #ddd; border-radius: 4px;" ';
@@ -1615,35 +2122,31 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
                 // File queue display area
                 html += '<div id="file-queue-' + invoiceId + '" style="margin-bottom: 15px; display: none;">';
-                html += '<h5 style="margin: 0 0 10px 0; color: #333; font-size: 13px;">Queued Files (will be uploaded when you click Save Dispute Form)</h5>';
+                html += '<h5 style="margin: 0 0 10px 0; color: #333; font-size: 13px; font-weight: bold;">Queued Files</h5>';
                 html += '<ul id="file-queue-list-' + invoiceId + '" style="list-style: none; padding: 0; margin: 0; border: 1px solid #ddd; border-radius: 4px; background: white;"></ul>';
                 html += '</div>';
 
-                // Attached files list (already uploaded)
+                // Attached files list
                 html += buildAttachedFilesList(responseRecordId, invoiceId);
 
                 html += '</div>';
 
-                // ============================================================================
-                // SECTION 3: DOCUMENT REQUIREMENTS (BOTTOM)
-                // ============================================================================
-                html += '<div style="background-color: #fff3cd; padding: 15px; border-radius: 4px; border: 1px solid #ffc107;">';
-                html += '<h4 style="margin-top: 0; color: #333;">Document Requirements Checklist</h4>';
-                html += '<div style="margin-bottom: 15px; font-size: 12px; color: #666;">';
-                html += 'Check each box to indicate you have completed the requirement. These checkboxes track what has been included ';
-                html += 'in the file attachments above.';
-                html += '</div>';
+                // ===== SUBSECTION 3: Requirements Checklist =====
+                html += '<div style="background-color: #fff; padding: 12px; border-radius: 4px; border: 1px solid #00a6deff;">';
+                html += '<h5 style="margin: 0 0 8px 0; color: #333; font-size: 13px; font-weight: bold;">Requirements Checklist</h5>';
 
                 // Required checkboxes
                 html += buildCheckboxField(invoiceId, 'r01e-checkbox', 'Completed R01E or C01E', 'Part of downloaded PDF from Commerce Control Center. R01E for normal disputes, C01E for fraud.', r01eChecked, true);
-                html += buildCheckboxField(invoiceId, 'netsuite-trans-checkbox', 'Relevant NetSuite Transactions', 'Include Sales Order and any refunds issued, if applicable.', netsuiteTransChecked, true);
-                html += buildCheckboxField(invoiceId, 'return-policy-checkbox', 'Return Policy Document', 'Automatically attached to all disputes.', returnPolicyChecked, true);
+                html += buildCheckboxField(invoiceId, 'netsuite-trans-checkbox', 'Relevant NetSuite Transactions', 'Include any transaction relevant to the dispute which may include the original Invoice, the original Sales Order, or both if helpful (one is required) plus any appropriate Credit Memo if a refund was issued.', netsuiteTransChecked, true);
+                html += buildCheckboxField(invoiceId, 'return-policy-checkbox', 'Return Policy Document', 'Automatically attached to all disputes when "Save & Merge" is clicked.', returnPolicyChecked, true);
 
                 // Optional checkboxes
                 html += buildCheckboxField(invoiceId, 'delivery-photos-checkbox', 'Delivery Photos from DispatchTrack or Proof of Delivery', 'Any relevant proof of delivery.', deliveryPhotosChecked, false);
                 html += buildCheckboxField(invoiceId, 'correspondence-checkbox', 'Correspondence from Sales', 'Include evidence that customer ID was verified, if available.', correspondenceChecked, false);
 
                 html += '</div>';
+
+                html += '</div>'; // End file-upload-section
 
                 html += '</div>'; // End checklist-form
 
@@ -1656,7 +2159,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
                 html += '<div style="display: flex; gap: 10px;">';
                 html += '<button type="button" class="action-btn" style="background-color: #28a745; font-size: 13px; padding: 8px 16px;" ';
-                html += 'onclick="saveDisputeFormWithFiles(\'' + invoiceId + '\', \'' + responseRecordId + '\')">Save Dispute Form</button>';
+                html += 'onclick="saveDisputeFormWithFiles(\'' + invoiceId + '\', \'' + responseRecordId + '\')">Save & Merge</button>';
                 html += '<button type="button" class="action-btn" style="background-color: #6c757d;" ';
                 html += 'onclick="toggleSubmissionChecklist(\'' + invoiceId + '\', \'' + responseRecordId + '\')">Close Checklist</button>';
                 html += '</div>';
@@ -1718,7 +2221,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 var attachedFiles = searchFilesAttachedToRecord(responseRecordId);
 
                 var html = '<div style="margin-top: 15px; border-top: 1px solid #ddd; padding-top: 15px;">';
-                html += '<h5 style="margin: 0 0 10px 0; color: #333;">Attached Files <span style="color: #dc3545;">*</span></h5>';
+                html += '<h5 style="margin: 0 0 10px 0; color: #333;">Previously Attached Files <span style="color: #dc3545;">*</span></h5>';
 
                 if (attachedFiles.length === 0) {
                     html += '<p style="color: #999; font-style: italic; margin: 0;">No files attached yet (at least 1 file required)</p>';
@@ -1748,15 +2251,17 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-      * NEW: Searches for files attached to a custom record
-      * FIXED: Use proper file join approach for custom records
-      * @param {string} responseRecordId - Response record internal ID
-      * @returns {Array} Array of file objects
-      */
-        function searchFilesAttachedToRecord(responseRecordId) {
+  * NEW: Searches for files attached to a custom record
+  * UPDATED: Filter out old merged documents and auto-generated files
+  * @param {string} responseRecordId - Response record internal ID
+  * @param {boolean} excludeGeneratedFiles - If true, exclude old DISPUTE_SUBMISSION, COVER_LETTER, and Return_Policy files
+  * @returns {Array} Array of file objects
+  */
+        function searchFilesAttachedToRecord(responseRecordId, excludeGeneratedFiles) {
             try {
                 log.debug('Searching Files Attached to Record', {
-                    responseRecordId: responseRecordId
+                    responseRecordId: responseRecordId,
+                    excludeGeneratedFiles: excludeGeneratedFiles || false
                 });
 
                 // Search the custom record and join to attached files
@@ -1778,12 +2283,33 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
                 fileSearch.run().each(function (result) {
                     var fileId = result.getValue({ name: 'internalid', join: 'file' });
+                    var fileName = result.getValue({ name: 'name', join: 'file' });
 
                     // Only add if we got a file ID (some records may not have files)
                     if (fileId) {
+                        // NEW: Skip auto-generated files if requested
+                        if (excludeGeneratedFiles) {
+                            var lowerFileName = fileName.toLowerCase();
+
+                            // Check if this is a file we should exclude
+                            var isDisputeSubmission = lowerFileName.indexOf('dispute_submission_') === 0;
+                            var isCoverLetter = lowerFileName.indexOf('cover_letter_') === 0;
+                            var isReturnPolicy = lowerFileName === 'return_policy.pdf';
+
+                            if (isDisputeSubmission || isCoverLetter || isReturnPolicy) {
+                                log.debug('Excluding Auto-Generated File', {
+                                    fileId: fileId,
+                                    fileName: fileName,
+                                    reason: isDisputeSubmission ? 'Old merged document' :
+                                        (isCoverLetter ? 'Old cover letter' : 'Return policy (will be re-attached)')
+                                });
+                                return true; // Skip this file, continue to next
+                            }
+                        }
+
                         files.push({
                             id: fileId,
-                            name: result.getValue({ name: 'name', join: 'file' }),
+                            name: fileName,
                             size: result.getValue({ name: 'documentsize', join: 'file' }),
                             created: result.getValue({ name: 'created', join: 'file' }),
                             url: result.getValue({ name: 'url', join: 'file' })
@@ -1791,7 +2317,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
                         log.debug('File Found Attached to Record', {
                             fileId: fileId,
-                            fileName: result.getValue({ name: 'name', join: 'file' }),
+                            fileName: fileName,
                             responseRecordId: responseRecordId
                         });
                     }
@@ -1801,6 +2327,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
                 log.debug('Files Attached to Record - Final Count', {
                     responseRecordId: responseRecordId,
+                    excludeGeneratedFiles: excludeGeneratedFiles || false,
                     fileCount: files.length,
                     files: files.map(function (f) { return { id: f.id, name: f.name }; })
                 });
@@ -1831,9 +2358,266 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-   * NEW: Handles saving the dispute form (checkboxes + text fields only)
-   * UPDATED: Set status to Completed, Pending Submission
-   * PHASE 1: Updated to handle multiple files in request.files
+  * NEW: Creates a cover letter PDF for dispute submission
+  * FIXED: Convert single \n to <br/>, double \n\n to paragraph breaks
+  * @param {string} caseNumber - Dispute case number
+  * @param {string} coverLetterText - User-provided description
+  * @param {string} customerId - Customer internal ID
+  * @param {string} customerEntityId - Customer entity ID
+  * @param {string} customerName - Customer name
+  * @param {string} responseRecordId - Response record ID for description
+  * @returns {Object} Result object with file ID and name
+  */
+        function createCoverLetterPDF(caseNumber, coverLetterText, customerId, customerEntityId, customerName, responseRecordId) {
+            try {
+                log.debug('Creating Cover Letter PDF', {
+                    caseNumber: caseNumber,
+                    customerId: customerId,
+                    customerName: customerName,
+                    responseRecordId: responseRecordId,
+                    coverLetterTextLength: coverLetterText ? coverLetterText.length : 0
+                });
+
+                // Get current user info
+                var currentUser = runtime.getCurrentUser();
+                var userId = currentUser.id;
+                var userName = currentUser.name;
+
+                try {
+                    var userRecord = record.load({
+                        type: record.Type.EMPLOYEE,
+                        id: userId,
+                        isDynamic: false
+                    });
+
+                    var displayName = userRecord.getValue('altname') || userRecord.getValue('entityid');
+
+                    if (displayName) {
+                        userName = displayName;
+                    } else {
+                        userName = currentUser.name.replace(/^\d+\s+/, '');
+                    }
+
+                    log.debug('User Name Retrieved', {
+                        userId: userId,
+                        originalName: currentUser.name,
+                        displayName: userName
+                    });
+
+                } catch (userLoadError) {
+                    log.error('Error loading user record - using parsed name', {
+                        error: userLoadError.toString(),
+                        originalName: currentUser.name
+                    });
+                    userName = currentUser.name.replace(/^\d+\s+/, '');
+                }
+
+                // Format today's date
+                var today = new Date();
+                var formattedDate = (today.getMonth() + 1) + '/' + today.getDate() + '/' + today.getFullYear();
+
+                // Build the cover letter HTML with proper BFO structure
+                var html = '<?xml version="1.0"?>\n';
+                html += '<!DOCTYPE pdf PUBLIC "-//big.faceless.org//report" "report-1.1.dtd">\n';
+                html += '<pdf>\n';
+                html += '<head>\n';
+                html += '<style type="text/css">\n';
+                // UPDATED: Remove line-height, use margins and padding instead
+                html += 'body { font-family: Arial, sans-serif; font-size: 11pt; margin: 40px; }\n';
+                html += 'p { margin: 0 0 18px 0; padding: 0; }\n';  // 18px bottom margin for spacing
+                html += '.subject { font-weight: bold; font-size: 12pt; margin-bottom: 18px; }\n';
+                html += '.date { margin-bottom: 24px; }\n';
+                html += '.salutation { margin-bottom: 18px; }\n';
+                html += '.body-text { margin-bottom: 18px; text-align: justify; }\n';
+                html += '.description-paragraph { margin: 0 0 18px 0; text-align: justify; }\n';  // Increased margin
+                html += '.signature { margin-top: 36px; }\n';
+                html += '</style>\n';
+                html += '</head>\n';
+                html += '<body>\n';
+
+                // Subject line
+                html += '<p class="subject">Subject: Chargeback Challenge - Case ' + escapeXml(caseNumber) + '</p>\n';
+
+                // Date
+                html += '<p class="date">Date: ' + formattedDate + '</p>\n';
+
+                // Salutation
+                html += '<p class="salutation">To Whom It May Concern,</p>\n';
+
+                // Opening paragraph
+                html += '<p class="body-text">';
+                html += 'We are formally disputing the chargeback associated with case <b>' + escapeXml(caseNumber) + '</b>. ';
+                html += 'We request that the chargeback be reversed based on the following facts:';
+                html += '</p>\n';
+
+                // UPDATED: User-provided description - use <br/><br/> for line breaks within paragraphs
+                if (coverLetterText && coverLetterText.trim() !== '') {
+                    var paragraphs = coverLetterText.trim().split(/\n\n+/);
+
+                    for (var i = 0; i < paragraphs.length; i++) {
+                        var para = paragraphs[i].trim();
+                        if (para !== '') {
+                            var escapedPara = escapeXml(para);
+                            // CHANGED: Use <br/><br/> instead of single <br/> for more vertical space
+                            var paraWithBreaks = escapedPara.replace(/\n/g, '<br/><br/>');
+                            html += '<p class="description-paragraph">' + paraWithBreaks + '</p>\n';
+                        }
+                    }
+                } else {
+                    html += '<p class="description-paragraph">[No description provided]</p>\n';
+                }
+
+                // Closing paragraph
+                html += '<p class="body-text">';
+                html += 'Please let us know if any additional documentation is needed. We are happy to provide supporting records.';
+                html += '</p>\n';
+
+                html += '<p class="body-text">';
+                html += 'Thank you for your attention to this matter.';
+                html += '</p>\n';
+
+                // Signature
+                html += '<div class="signature">\n';
+                html += '<p style="margin: 0 0 6px 0;">Sincerely,</p>\n';
+                html += '<p style="margin: 0 0 6px 0;"><b>' + escapeXml(userName) + '</b></p>\n';
+                html += '<p style="margin: 0 0 6px 0;">Accounting Department</p>\n';
+                html += '<p style="margin: 0;">Bray &amp; Scarff</p>\n';
+                html += '</div>\n';
+
+                html += '</body>\n';
+                html += '</pdf>';
+
+                log.debug('Cover Letter HTML Generated', {
+                    htmlLength: html.length,
+                    hasCoverLetterText: !!(coverLetterText && coverLetterText.trim() !== ''),
+                    userName: userName,
+                    paragraphCount: coverLetterText ? coverLetterText.trim().split(/\n\n+/).length : 0
+                });
+
+                // Render the HTML to PDF
+                var pdfFile = render.xmlToPdf({
+                    xmlString: html
+                });
+
+                // Create filename
+                var cleanCustomerName = customerName.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 50);
+                var fileName = 'COVER_LETTER_' + customerEntityId + '_' + cleanCustomerName + '.pdf';
+
+                // Save to File Cabinet
+                var fileObj = file.create({
+                    name: fileName,
+                    fileType: file.Type.PDF,
+                    contents: pdfFile.getContents(),
+                    folder: 2762649,
+                    description: 'Cover letter for Response Record #' + responseRecordId + ' - Case #' + caseNumber
+                });
+
+                var fileId = fileObj.save();
+
+                log.audit('Cover Letter PDF Created', {
+                    fileId: fileId,
+                    fileName: fileName,
+                    caseNumber: caseNumber,
+                    responseRecordId: responseRecordId,
+                    userName: userName
+                });
+
+                // Attach to response record
+                record.attach({
+                    record: { type: 'file', id: fileId },
+                    to: { type: 'customrecord_chargeback_response', id: responseRecordId }
+                });
+
+                log.debug('Cover Letter Attached to Response Record', {
+                    fileId: fileId,
+                    responseRecordId: responseRecordId
+                });
+
+                return {
+                    success: true,
+                    fileId: fileId,
+                    fileName: fileName
+                };
+
+            } catch (e) {
+                log.error('Error Creating Cover Letter PDF', {
+                    error: e.toString(),
+                    stack: e.stack,
+                    caseNumber: caseNumber
+                });
+                return {
+                    success: false,
+                    error: e.toString()
+                };
+            }
+        }
+
+        /**
+* NEW: Attaches the Return Policy PDF to a response record
+* @param {string} responseRecordId - Response record internal ID
+* @returns {Object} Result object with file ID and name
+*/
+        function attachReturnPolicy(responseRecordId) {
+            try {
+                log.debug('Attaching Return Policy PDF', {
+                    responseRecordId: responseRecordId
+                });
+
+                // The Return Policy PDF should be stored in the File Cabinet
+                // File ID: 3044852 (based on your previous work)
+                var returnPolicyFileId = '5021365';
+
+                // Load the file to verify it exists
+                var returnPolicyFile = file.load({
+                    id: returnPolicyFileId
+                });
+
+                log.debug('Return Policy File Loaded', {
+                    fileId: returnPolicyFileId,
+                    fileName: returnPolicyFile.name
+                });
+
+                // Attach the file to the response record
+                record.attach({
+                    record: {
+                        type: 'file',
+                        id: returnPolicyFileId
+                    },
+                    to: {
+                        type: 'customrecord_chargeback_response',
+                        id: responseRecordId
+                    }
+                });
+
+                log.audit('Return Policy Attached to Response Record', {
+                    fileId: returnPolicyFileId,
+                    fileName: returnPolicyFile.name,
+                    responseRecordId: responseRecordId
+                });
+
+                return {
+                    success: true,
+                    fileId: returnPolicyFileId,
+                    fileName: returnPolicyFile.name
+                };
+
+            } catch (e) {
+                log.error('Error Attaching Return Policy', {
+                    error: e.toString(),
+                    stack: e.stack,
+                    responseRecordId: responseRecordId
+                });
+
+                return {
+                    success: false,
+                    error: e.toString()
+                };
+            }
+        }
+
+        /**
+   * Handles saving the dispute form (checkboxes + text fields + files)
+   * UPDATED: Pass cover letter and return policy file IDs to merge function
    * @param {Object} context
    */
         function handleSaveDisputeForm(context) {
@@ -1843,7 +2627,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             var caseNumber = request.parameters.caseNumber;
             var coverLetter = request.parameters.coverLetter;
 
-            // Get checkbox states
+            var selectedTransactions = request.parameters.selectedTransactions || '';
+
             var r01eChecked = request.parameters.r01eChecked === 'true';
             var netsuiteTransChecked = request.parameters.netsuiteTransChecked === 'true';
             var returnPolicyChecked = request.parameters.returnPolicyChecked === 'true';
@@ -1859,6 +2644,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 returnPolicyChecked: returnPolicyChecked,
                 deliveryPhotosChecked: deliveryPhotosChecked,
                 correspondenceChecked: correspondenceChecked,
+                selectedTransactions: selectedTransactions,
                 hasFiles: !!(request.files && Object.keys(request.files).length > 0),
                 fileKeys: request.files ? Object.keys(request.files) : []
             });
@@ -1868,7 +2654,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     throw new Error('Response Record ID is required');
                 }
 
-                // Validate required fields
                 if (!caseNumber || caseNumber.trim() === '') {
                     throw new Error('Case Number is required');
                 }
@@ -1881,14 +2666,57 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     throw new Error('All required document checkboxes must be checked');
                 }
 
-                // PHASE 1: Process multiple files if any were uploaded
+                var responseRecord = record.load({
+                    type: 'customrecord_chargeback_response',
+                    id: responseRecordId,
+                    isDynamic: false
+                });
+
+                var customerId = responseRecord.getValue('custrecord_customer');
+
+                var customerRecord = record.load({
+                    type: record.Type.CUSTOMER,
+                    id: customerId,
+                    isDynamic: false
+                });
+
+                var customerEntityId = customerRecord.getValue('entityid');
+                var customerName = customerRecord.getValue('companyname') || customerRecord.getValue('altname') || customerEntityId;
+
+                log.debug('Customer Info Retrieved for Cover Letter', {
+                    customerId: customerId,
+                    customerEntityId: customerEntityId,
+                    customerName: customerName
+                });
+
+                // STEP 1 - Create cover letter PDF FIRST (ALWAYS create new one, even when re-saving)
+                var coverLetterResult = createCoverLetterPDF(
+                    caseNumber,
+                    coverLetter,
+                    customerId,
+                    customerEntityId,
+                    customerName,
+                    responseRecordId
+                );
+
+                if (!coverLetterResult.success) {
+                    throw new Error('Failed to create cover letter: ' + coverLetterResult.error);
+                }
+
+                log.audit('Cover Letter Created Successfully', {
+                    fileId: coverLetterResult.fileId,
+                    fileName: coverLetterResult.fileName
+                });
+
                 var filesProcessed = 0;
                 var fileErrors = [];
+                var pdfFilesGenerated = 0;
 
+                // STEP 2 - Process manually uploaded files
                 if (request.files && Object.keys(request.files).length > 0) {
                     var fileKeys = Object.keys(request.files);
 
-                    log.debug('Processing Multiple Files', {
+                    log.debug('Processing Manual File Uploads', {
                         totalFileKeys: fileKeys.length,
                         keys: fileKeys
                     });
@@ -1897,40 +2725,17 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         var fileKey = fileKeys[i];
                         var uploadedFile = request.files[fileKey];
 
-                        // Skip if no valid file
                         if (!uploadedFile || !uploadedFile.name) {
-                            log.debug('Skipping invalid file entry', {
-                                fileKey: fileKey,
-                                hasFile: !!uploadedFile,
-                                hasName: uploadedFile ? !!uploadedFile.name : false
-                            });
                             continue;
                         }
 
                         try {
-                            log.debug('Processing File', {
-                                fileName: uploadedFile.name,
-                                fileSize: uploadedFile.size,
-                                mimeType: uploadedFile.type || 'not provided',
-                                fileIndex: i + 1,
-                                totalFiles: fileKeys.length
-                            });
-
-                            // Validate and determine file type
                             var fileTypeInfo = getNetSuiteFileType(uploadedFile.type, uploadedFile.name);
 
                             if (!fileTypeInfo.isValid) {
-                                var allowedTypes = 'PDF, PNG, JPG, GIF, DOC, DOCX, XLS, XLSX';
-                                throw new Error('Invalid file type for ' + uploadedFile.name + '. Only ' + allowedTypes + ' files are allowed.');
+                                throw new Error('Invalid file type for ' + uploadedFile.name);
                             }
 
-                            log.debug('File Type Validated', {
-                                fileName: uploadedFile.name,
-                                detectionMethod: fileTypeInfo.detectionMethod,
-                                netsuiteFileType: fileTypeInfo.fileType
-                            });
-
-                            // Create file in File Cabinet
                             var fileObj = file.create({
                                 name: uploadedFile.name,
                                 fileType: fileTypeInfo.fileType,
@@ -1941,66 +2746,153 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
                             var savedFileId = fileObj.save();
 
-                            log.debug('File Created in Cabinet', {
-                                fileId: savedFileId,
-                                fileName: uploadedFile.name,
-                                fileType: fileTypeInfo.fileType
-                            });
-
-                            // Attach the file to the custom record
                             record.attach({
-                                record: {
-                                    type: 'file',
-                                    id: savedFileId
-                                },
-                                to: {
-                                    type: 'customrecord_chargeback_response',
-                                    id: responseRecordId
-                                }
-                            });
-
-                            log.debug('File Attached to Response Record', {
-                                fileId: savedFileId,
-                                fileName: uploadedFile.name,
-                                responseRecordId: responseRecordId
+                                record: { type: 'file', id: savedFileId },
+                                to: { type: 'customrecord_chargeback_response', id: responseRecordId }
                             });
 
                             filesProcessed++;
 
                         } catch (fileError) {
-                            log.error('Error Processing Individual File', {
+                            log.error('Error Processing Manual File', {
                                 fileName: uploadedFile.name,
-                                error: fileError.toString(),
-                                stack: fileError.stack
+                                error: fileError.toString()
                             });
-
                             fileErrors.push({
                                 fileName: uploadedFile.name,
                                 error: fileError.toString()
                             });
                         }
                     }
+                }
 
-                    log.debug('File Processing Complete', {
-                        totalFilesProcessed: filesProcessed,
-                        totalErrors: fileErrors.length,
-                        errors: fileErrors
+                // STEP 3 - Generate PDFs for selected transactions
+                if (selectedTransactions && selectedTransactions.trim() !== '') {
+                    var transactionIds = selectedTransactions.split(',');
+
+                    log.debug('Generating Transaction PDFs', {
+                        count: transactionIds.length,
+                        ids: transactionIds
+                    });
+
+                    for (var t = 0; t < transactionIds.length; t++) {
+                        var transId = transactionIds[t].trim();
+
+                        if (!transId) continue;
+
+                        try {
+                            var transLookup = search.lookupFields({
+                                type: search.Type.TRANSACTION,
+                                id: transId,
+                                columns: ['type', 'tranid']
+                            });
+
+                            var tranType = transLookup.type[0].value;
+                            var tranIdText = transLookup.tranid;
+
+                            log.debug('Generating PDF for Transaction', {
+                                transactionId: transId,
+                                type: tranType,
+                                tranid: tranIdText
+                            });
+
+                            var typePrefix = 'TRANS';
+                            if (tranType === 'SalesOrd') {
+                                typePrefix = 'SO';
+                            } else if (tranType === 'CustInvc') {
+                                typePrefix = 'INV';
+                            } else if (tranType === 'CustCred') {
+                                typePrefix = 'CM';
+                            }
+
+                            var pdfFile = render.transaction({
+                                entityId: parseInt(transId),
+                                printMode: render.PrintMode.PDF
+                            });
+
+                            var pdfFileName = typePrefix + '-' + tranIdText + '.pdf';
+                            var pdfFileObj = file.create({
+                                name: pdfFileName,
+                                fileType: file.Type.PDF,
+                                contents: pdfFile.getContents(),
+                                folder: 2762649,
+                                description: 'Auto-generated for Response Record #' + responseRecordId
+                            });
+
+                            var pdfFileId = pdfFileObj.save();
+
+                            record.attach({
+                                record: { type: 'file', id: pdfFileId },
+                                to: { type: 'customrecord_chargeback_response', id: responseRecordId }
+                            });
+
+                            log.debug('PDF Generated and Attached', {
+                                fileName: pdfFileName,
+                                fileId: pdfFileId,
+                                transactionId: transId
+                            });
+
+                            pdfFilesGenerated++;
+
+                        } catch (pdfError) {
+                            log.error('Error Generating Transaction PDF', {
+                                transactionId: transId,
+                                error: pdfError.toString(),
+                                stack: pdfError.stack
+                            });
+
+                            fileErrors.push({
+                                fileName: 'Transaction PDF #' + transId,
+                                error: pdfError.toString()
+                            });
+                        }
+                    }
+                }
+
+                // STEP 4 - Attach Return Policy PDF (ALWAYS attach fresh copy, even when re-saving)
+                var returnPolicyResult = attachReturnPolicy(responseRecordId);
+                if (!returnPolicyResult.success) {
+                    log.error('Failed to attach Return Policy', returnPolicyResult.error);
+                } else {
+                    log.audit('Return Policy Attached', {
+                        fileId: returnPolicyResult.fileId,
+                        fileName: returnPolicyResult.fileName
                     });
                 }
 
-                // Check if at least one file is attached (either from this upload or previously)
-                var attachedFiles = searchFilesAttachedToRecord(responseRecordId);
+                // Get file count EXCLUDING old auto-generated files (for validation)
+                var attachedFiles = searchFilesAttachedToRecord(responseRecordId, true); // Pass true to exclude generated files
 
-                log.debug('Total Files Attached to Record', {
-                    currentlyAttached: attachedFiles.length,
-                    justProcessed: filesProcessed
+                log.debug('Total Files After Processing (Excluding Old Generated Files)', {
+                    coverLetterCreated: coverLetterResult.success,
+                    manualFilesProcessed: filesProcessed,
+                    pdfFilesGenerated: pdfFilesGenerated,
+                    returnPolicyAttached: returnPolicyResult.success,
+                    totalAttached: attachedFiles.length,
+                    errors: fileErrors.length
                 });
 
                 if (attachedFiles.length === 0) {
                     throw new Error('At least one file must be attached before saving the dispute form');
                 }
 
-                // Update the response record with field values and checkboxes
+                var invoiceRecord = record.load({
+                    type: record.Type.INVOICE,
+                    id: invoiceId,
+                    isDynamic: false
+                });
+                var invoiceTranId = invoiceRecord.getValue('tranid');
+
+                // STEP 5 - Merge all attached files into single PDF
+                // UPDATED: Pass the new cover letter and return policy file IDs
+                var mergeResult = mergeAttachedFilesIntoPDF(
+                    responseRecordId,
+                    invoiceTranId,
+                    coverLetterResult.fileId,  // NEW cover letter ID
+                    returnPolicyResult.fileId   // NEW return policy ID
+                );
+
+                // STEP 6 - Update the response record
                 record.submitFields({
                     type: 'customrecord_chargeback_response',
                     id: responseRecordId,
@@ -2016,26 +2908,25 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     }
                 });
 
-                log.audit('Dispute Form Saved', {
+                log.audit('Dispute Form Saved with Cover Letter, Return Policy, and Merged PDF', {
                     responseRecordId: responseRecordId,
                     invoiceId: invoiceId,
                     caseNumber: caseNumber,
-                    filesProcessed: filesProcessed,
-                    filesAttached: attachedFiles.length,
+                    coverLetterCreated: coverLetterResult.fileName,
+                    coverLetterFileId: coverLetterResult.fileId,
+                    returnPolicyAttached: returnPolicyResult.success,
+                    returnPolicyFileId: returnPolicyResult.fileId,
+                    manualFilesProcessed: filesProcessed,
+                    pdfFilesGenerated: pdfFilesGenerated,
+                    totalFilesAttached: attachedFiles.length,
                     fileErrors: fileErrors.length,
+                    mergedPDFCreated: mergeResult.success,
+                    mergedFileName: mergeResult.mergedFileName || 'N/A',
+                    mergedFileId: mergeResult.mergedFileId || 'N/A',
                     statusUpdated: 'Completed, Pending Submission'
                 });
 
-                // Build success message
-                var successMsg = 'Dispute form saved successfully';
-                if (filesProcessed > 0) {
-                    successMsg += ' with ' + filesProcessed + ' file(s) uploaded';
-                }
-                if (fileErrors.length > 0) {
-                    successMsg += '. Warning: ' + fileErrors.length + ' file(s) failed to upload';
-                }
-
-                // Redirect back with success
+                // Redirect with merged file ID (buildPageHTML will load the proper URL)
                 redirect.toSuitelet({
                     scriptId: runtime.getCurrentScript().id,
                     deploymentId: runtime.getCurrentScript().deploymentId,
@@ -2043,8 +2934,13 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         disputeFormSaved: 'true',
                         responseRecordId: responseRecordId,
                         invoiceId: invoiceId,
-                        filesProcessed: filesProcessed.toString(),
-                        fileErrors: fileErrors.length.toString()
+                        filesProcessed: (filesProcessed + pdfFilesGenerated + 2).toString(), // +2 for cover letter and return policy
+                        fileErrors: fileErrors.length.toString(),
+                        mergedPDFCreated: mergeResult.success ? 'true' : 'false',
+                        mergedFileName: mergeResult.mergedFileName || '',
+                        mergedFileId: mergeResult.mergedFileId || '',
+                        coverLetterCreated: 'true',
+                        returnPolicyAttached: returnPolicyResult.success ? 'true' : 'false'
                     }
                 });
 
@@ -2065,6 +2961,366 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         checklistSaved: 'true'
                     }
                 });
+            }
+        }
+
+
+        /**
+ * Merges all files attached to a response record into a single PDF using PDF.co API
+ * FIXED: Properly identify new cover letter and return policy files to include them
+ * @param {string} responseRecordId - Internal ID of the chargeback response custom record
+ * @param {string} invoiceTranId - Transaction ID of the related invoice (used for logging only)
+ * @param {string} newCoverLetterId - Internal ID of the newly created cover letter (to keep it)
+ * @param {string} newReturnPolicyId - Internal ID of the newly attached return policy (to keep it)
+ * @returns {Object} Result object
+ */
+        function mergeAttachedFilesIntoPDF(responseRecordId, invoiceTranId, newCoverLetterId, newReturnPolicyId) {
+            try {
+                log.debug('Merging Attached Files into PDF using PDF.co', {
+                    responseRecordId: responseRecordId,
+                    invoiceTranId: invoiceTranId,
+                    newCoverLetterId: newCoverLetterId,
+                    newReturnPolicyId: newReturnPolicyId
+                });
+
+                // Get script parameter for PDF.co API key
+                var script = runtime.getCurrentScript();
+                var API_KEY = script.getParameter({
+                    name: 'custscript_pdfco_api_key'
+                });
+
+                if (!API_KEY) {
+                    log.error('Missing PDF.co API Key parameter');
+                    return {
+                        success: false,
+                        error: 'PDF.co API Key parameter not configured'
+                    };
+                }
+
+                // UPDATED: Get ALL attached files WITHOUT exclusions
+                var attachedFiles = searchFilesAttachedToRecord(responseRecordId, false); // Pass false - get ALL files
+
+                if (attachedFiles.length === 0) {
+                    log.debug('No files to merge after excluding auto-generated files');
+                    return { success: false, message: 'No files to merge' };
+                }
+
+                log.debug('All Attached Files Retrieved', {
+                    totalCount: attachedFiles.length,
+                    files: attachedFiles.map(function (f) {
+                        return {
+                            id: f.id,
+                            name: f.name,
+                            isNewCoverLetter: f.id === newCoverLetterId,
+                            isNewReturnPolicy: f.id === newReturnPolicyId
+                        };
+                    })
+                });
+
+                // FIXED: Manually filter - exclude only OLD merged documents and OLD versions
+                var filesToMerge = [];
+
+                for (var i = 0; i < attachedFiles.length; i++) {
+                    var f = attachedFiles[i];
+                    var lowerFileName = f.name.toLowerCase();
+
+                    // Skip ONLY old dispute submissions (not cover letters or return policies)
+                    if (lowerFileName.indexOf('dispute_submission_') === 0) {
+                        log.debug('Excluding Old Merged Document', {
+                            fileId: f.id,
+                            fileName: f.name
+                        });
+                        continue; // Skip this file
+                    }
+
+                    // FIXED: Skip old cover letters ONLY IF this is NOT the new one we just created
+                    // Use == for comparison to handle string vs number
+                    if (lowerFileName.indexOf('cover_letter_') === 0 && f.id != newCoverLetterId) {
+                        log.debug('Excluding Old Cover Letter', {
+                            fileId: f.id,
+                            fileName: f.name,
+                            newCoverLetterId: newCoverLetterId,
+                            reason: 'Old version - new cover letter ID is ' + newCoverLetterId
+                        });
+                        continue; // Skip old cover letter
+                    }
+
+                    // FIXED: Skip old return policies ONLY IF this is NOT the new one we just attached
+                    // Use == for comparison to handle string vs number
+                    if (lowerFileName === 'return_policy.pdf' && f.id != newReturnPolicyId) {
+                        log.debug('Excluding Old Return Policy', {
+                            fileId: f.id,
+                            fileName: f.name,
+                            newReturnPolicyId: newReturnPolicyId,
+                            reason: 'Old version - new return policy ID is ' + newReturnPolicyId
+                        });
+                        continue; // Skip old return policy
+                    }
+
+                    // Include this file
+                    filesToMerge.push(f);
+
+                    log.debug('Including File in Merge', {
+                        fileId: f.id,
+                        fileName: f.name,
+                        isNewCoverLetter: f.id == newCoverLetterId,
+                        isNewReturnPolicy: f.id == newReturnPolicyId
+                    });
+                }
+
+                if (filesToMerge.length === 0) {
+                    log.debug('No files remaining after filtering');
+                    return { success: false, message: 'No files to merge after filtering' };
+                }
+
+                log.debug('Files After Filtering', {
+                    originalCount: attachedFiles.length,
+                    afterFilteringCount: filesToMerge.length,
+                    excluded: attachedFiles.length - filesToMerge.length
+                });
+
+                // Load response record to get customer info
+                var responseRecord = record.load({
+                    type: 'customrecord_chargeback_response',
+                    id: responseRecordId,
+                    isDynamic: false
+                });
+
+                var customerId = responseRecord.getValue('custrecord_customer');
+
+                // Load customer record to get customer name
+                var customerRecord = record.load({
+                    type: record.Type.CUSTOMER,
+                    id: customerId,
+                    isDynamic: false
+                });
+
+                var customerEntityId = customerRecord.getValue('entityid');
+                var customerName = customerRecord.getValue('companyname') || customerRecord.getValue('altname') || customerEntityId;
+
+                // Clean customer name for filename (remove special characters)
+                var cleanCustomerName = customerName.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 50);
+
+                log.debug('Customer Info Retrieved', {
+                    customerId: customerId,
+                    customerEntityId: customerEntityId,
+                    customerName: customerName,
+                    cleanCustomerName: cleanCustomerName
+                });
+
+                // Sort files into ordered buckets
+                var coverLetterFile = null;
+                var otherFiles = [];
+                var returnPolicyFile = null;
+
+                for (var i = 0; i < filesToMerge.length; i++) {
+                    var fileName = filesToMerge[i].name.toLowerCase();
+
+                    // FIXED: Identify NEW cover letter by ID using == comparison
+                    if (filesToMerge[i].id == newCoverLetterId) {
+                        coverLetterFile = filesToMerge[i];
+                        log.debug('Found NEW Cover Letter', {
+                            fileId: filesToMerge[i].id,
+                            fileName: filesToMerge[i].name
+                        });
+                    }
+                    // FIXED: Identify NEW return policy by ID using == comparison
+                    else if (filesToMerge[i].id == newReturnPolicyId) {
+                        returnPolicyFile = filesToMerge[i];
+                        log.debug('Found NEW Return Policy', {
+                            fileId: filesToMerge[i].id,
+                            fileName: filesToMerge[i].name
+                        });
+                    }
+                    // Everything else goes in the middle
+                    else {
+                        otherFiles.push(filesToMerge[i]);
+                    }
+                }
+
+                // Build ordered file array: Cover Letter, Other Files, Return Policy
+                var orderedFiles = [];
+
+                if (coverLetterFile) {
+                    orderedFiles.push(coverLetterFile);
+                } else {
+                    log.error('NEW Cover Letter Missing', 'Expected to find cover letter with ID: ' + newCoverLetterId);
+                }
+
+                orderedFiles = orderedFiles.concat(otherFiles);
+
+                if (returnPolicyFile) {
+                    orderedFiles.push(returnPolicyFile);
+                } else {
+                    log.error('NEW Return Policy Missing', 'Expected to find return policy with ID: ' + newReturnPolicyId);
+                }
+
+                log.debug('Files Ordered for Merging', {
+                    hasCoverLetter: !!coverLetterFile,
+                    coverLetterId: coverLetterFile ? coverLetterFile.id : 'MISSING',
+                    otherFilesCount: otherFiles.length,
+                    hasReturnPolicy: !!returnPolicyFile,
+                    returnPolicyId: returnPolicyFile ? returnPolicyFile.id : 'MISSING',
+                    totalFiles: orderedFiles.length,
+                    order: orderedFiles.map(function (f) { return f.name; })
+                });
+
+                // Prepare file URLs for PDF.co API in the correct order
+                var fileUrls = [];
+                for (var i = 0; i < orderedFiles.length; i++) {
+                    var fileObj = file.load({
+                        id: orderedFiles[i].id
+                    });
+
+                    // Make file public temporarily for PDF.co to access
+                    fileObj.isOnline = true;
+                    var publicFileId = fileObj.save();
+
+                    // Reload to get public URL
+                    var publicFile = file.load({
+                        id: publicFileId
+                    });
+
+                    var publicUrl = publicFile.url;
+                    if (publicUrl && publicUrl.indexOf('http') !== 0) {
+                        publicUrl = 'https://system.netsuite.com' + publicUrl;
+                    }
+
+                    fileUrls.push(publicUrl);
+
+                    log.debug('File made public for merging', {
+                        position: i + 1,
+                        fileId: orderedFiles[i].id,
+                        fileName: fileObj.name,
+                        publicUrl: publicUrl,
+                        isCoverLetter: orderedFiles[i].id == newCoverLetterId,
+                        isReturnPolicy: orderedFiles[i].id == newReturnPolicyId
+                    });
+                }
+
+                // Merged filename with customer ID and name
+                var mergedFileName = 'DISPUTE_SUBMISSION_' + customerEntityId + '_' + cleanCustomerName + '.pdf';
+
+                var jsonPayload = JSON.stringify({
+                    url: fileUrls.join(','),
+                    name: mergedFileName,
+                    async: false
+                });
+
+                var response = https.post({
+                    url: 'https://api.pdf.co/v1/pdf/merge2',
+                    body: jsonPayload,
+                    headers: {
+                        'x-api-key': API_KEY,
+                        'Content-Type': 'application/json'
+                    }
+                });
+
+                log.debug('PDF.co API Response', {
+                    statusCode: response.code,
+                    responseBody: response.body
+                });
+
+                if (response.code === 200) {
+                    var data = JSON.parse(response.body);
+
+                    if (data.error == false) {
+                        log.debug('PDF merge successful', {
+                            mergedPdfUrl: data.url,
+                            originalFileCount: filesToMerge.length,
+                            newFileName: mergedFileName,
+                            documentOrder: 'Cover Letter → Other Files → Return Policy',
+                            includedNewCoverLetter: !!coverLetterFile,
+                            includedNewReturnPolicy: !!returnPolicyFile
+                        });
+
+                        // Download merged PDF from PDF.co
+                        var mergedPdfResponse = https.get({
+                            url: data.url
+                        });
+
+                        if (mergedPdfResponse.code === 200) {
+                            // Save merged PDF to NetSuite
+                            var mergedFileObj = file.create({
+                                name: mergedFileName,
+                                fileType: file.Type.PDF,
+                                contents: mergedPdfResponse.body,
+                                folder: 2762649,
+                                description: 'Merged dispute files for Response Record #' + responseRecordId + ' - Customer: ' + customerName
+                            });
+
+                            var mergedFileId = mergedFileObj.save();
+
+                            log.debug('Merged PDF saved to NetSuite', {
+                                fileId: mergedFileId,
+                                fileName: mergedFileName
+                            });
+
+                            // Attach merged PDF to response record
+                            record.attach({
+                                record: { type: 'file', id: mergedFileId },
+                                to: { type: 'customrecord_chargeback_response', id: responseRecordId }
+                            });
+
+                            log.audit('Merged PDF Attached to Response Record', {
+                                mergedFileId: mergedFileId,
+                                mergedFileName: mergedFileName,
+                                responseRecordId: responseRecordId,
+                                originalFileCount: filesToMerge.length,
+                                customerId: customerId,
+                                customerName: customerName,
+                                documentOrder: 'Cover Letter first, Return Policy last',
+                                verifiedNewCoverLetter: coverLetterFile ? 'Included - ID: ' + coverLetterFile.id : 'MISSING',
+                                verifiedNewReturnPolicy: returnPolicyFile ? 'Included - ID: ' + returnPolicyFile.id : 'MISSING'
+                            });
+
+                            return {
+                                success: true,
+                                mergedFileId: mergedFileId,
+                                mergedFileName: mergedFileName,
+                                originalFileCount: filesToMerge.length
+                            };
+                        } else {
+                            log.error('Failed to download merged PDF from PDF.co', {
+                                statusCode: mergedPdfResponse.code,
+                                url: data.url
+                            });
+                            return {
+                                success: false,
+                                error: 'Failed to download merged PDF: HTTP ' + mergedPdfResponse.code
+                            };
+                        }
+                    } else {
+                        log.error('PDF.co merge error', {
+                            error: data.message
+                        });
+                        return {
+                            success: false,
+                            error: data.message
+                        };
+                    }
+                } else {
+                    log.error('PDF.co API request failed', {
+                        statusCode: response.code,
+                        responseBody: response.body
+                    });
+                    return {
+                        success: false,
+                        error: 'HTTP ' + response.code
+                    };
+                }
+
+            } catch (e) {
+                log.error('Error Merging Files into PDF', {
+                    error: e.toString(),
+                    stack: e.stack,
+                    responseRecordId: responseRecordId,
+                    message: e.message
+                });
+                return {
+                    success: false,
+                    error: e.toString()
+                };
             }
         }
 
@@ -3767,11 +5023,12 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-         * Processes deposit refund - creates customer refund applying to deposit
-         * @param {string} depositId - Customer Deposit internal ID
-         * @param {string} type - 'chargeback', 'fraud', or 'nsf'
-         * @returns {Object} Result with refund details
-         */
+ * Processes deposit refund - creates customer refund applying to deposit
+ * UPDATED: Update Sales Order with appropriate checkbox based on type
+ * @param {string} depositId - Customer Deposit internal ID
+ * @param {string} type - 'chargeback', 'fraud', or 'nsf'
+ * @returns {Object} Result with refund details
+ */
         function processDepositRefund(depositId, type) {
             log.audit('Processing Deposit Refund', {
                 depositId: depositId,
@@ -3894,140 +5151,56 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 linkedSalesOrder: salesOrderId || 'None'
             });
 
+            // NEW: Update Sales Order with appropriate checkbox if Sales Order exists
+            if (salesOrderId) {
+                try {
+                    // Determine which checkbox to update based on type
+                    var checkboxField;
+                    if (type === 'nsf') {
+                        checkboxField = 'custbody_bas_nsf_check';
+                    } else if (type === 'fraud') {
+                        checkboxField = 'custbody_bas_fraud';
+                    } else { // chargeback (dispute)
+                        checkboxField = 'custbody_bas_cc_dispute';
+                    }
+
+                    // Update the Sales Order checkbox
+                    var updateValues = {};
+                    updateValues[checkboxField] = true;
+
+                    record.submitFields({
+                        type: record.Type.SALES_ORDER,
+                        id: salesOrderId,
+                        values: updateValues
+                    });
+
+                    log.audit('Sales Order Updated with Checkbox', {
+                        salesOrderId: salesOrderId,
+                        checkboxField: checkboxField,
+                        checkboxValue: true,
+                        depositId: depositId,
+                        refundType: type
+                    });
+
+                } catch (soUpdateError) {
+                    log.error('Error Updating Sales Order Checkbox', {
+                        error: soUpdateError.toString(),
+                        stack: soUpdateError.stack,
+                        salesOrderId: salesOrderId,
+                        checkboxField: checkboxField,
+                        depositId: depositId
+                    });
+                    // Don't throw error - the refund was created successfully
+                }
+            }
+
             return {
                 refundId: refundId,
-                refundTranId: customTranId,  // NEW: Return tranid
-                depositTranId: tranId,       // NEW: Return deposit tranid
+                refundTranId: customTranId,
+                depositTranId: tranId,
                 customerName: customerName,
                 amount: amountToRefund
             };
-        }
-
-        /**
-         * Handles file upload via form submission (not AJAX)
-         * @param {Object} context
-         */
-        function handleFileUploadForm(context) {
-            var request = context.request;
-            var response = context.response;
-            var invoiceId = request.parameters.custpage_invoice_id;
-            var fileDescription = request.parameters.custpage_file_description || '';
-
-            log.debug('Form File Upload Request', {
-                invoiceId: invoiceId,
-                description: fileDescription,
-                allParams: Object.keys(request.parameters),
-                allFiles: Object.keys(request.files || {})
-            });
-
-            try {
-                if (!invoiceId) {
-                    throw new Error('Invoice ID is required');
-                }
-
-                // Get the file from request.files
-                var uploadedFile = null;
-                var fileKeys = Object.keys(request.files || {});
-
-                log.debug('Available file keys', JSON.stringify(fileKeys));
-
-                // Try to find the file in request.files
-                for (var i = 0; i < fileKeys.length; i++) {
-                    var key = fileKeys[i];
-                    if (key.indexOf('custpage_dispute_file') !== -1 || key.indexOf('dispute') !== -1) {
-                        uploadedFile = request.files[key];
-                        log.debug('Found file with key', key);
-                        break;
-                    }
-                }
-
-                // If still not found, try the exact field name
-                if (!uploadedFile && request.files.custpage_dispute_file) {
-                    uploadedFile = request.files.custpage_dispute_file;
-                }
-
-                if (!uploadedFile) {
-                    throw new Error('No file was uploaded. Please select a file and try again. Available keys: ' + fileKeys.join(', '));
-                }
-
-                // Load invoice to get details
-                var invoiceRecord = record.load({
-                    type: record.Type.INVOICE,
-                    id: invoiceId,
-                    isDynamic: false
-                });
-
-                var tranId = invoiceRecord.getValue('tranid');
-                var customerName = invoiceRecord.getText('entity');
-
-                // Create file record
-                var fileObj = file.create({
-                    name: uploadedFile.name,
-                    fileType: uploadedFile.type,
-                    contents: uploadedFile.getContents(),
-                    folder: 2762649 // Chargeback Dispute Uploads folder
-                });
-
-                // Set description if provided
-                if (fileDescription) {
-                    fileObj.description = fileDescription;
-                }
-
-                // Save the file
-                var fileId = fileObj.save();
-
-                log.debug('File Created', {
-                    fileId: fileId,
-                    fileName: uploadedFile.name
-                });
-
-                // Attach file to invoice transaction
-                record.attach({
-                    record: {
-                        type: 'file',
-                        id: fileId
-                    },
-                    to: {
-                        type: record.Type.INVOICE,
-                        id: invoiceId
-                    }
-                });
-
-                log.audit('File Attached to Invoice', {
-                    fileId: fileId,
-                    fileName: uploadedFile.name,
-                    invoiceId: invoiceId,
-                    tranId: tranId
-                });
-
-                // Redirect back with success message
-                redirect.toSuitelet({
-                    scriptId: runtime.getCurrentScript().id,
-                    deploymentId: runtime.getCurrentScript().deploymentId,
-                    parameters: {
-                        uploadSuccess: 'true',
-                        fileName: encodeURIComponent(uploadedFile.name),
-                        invoiceId: invoiceId,
-                        invoice: tranId
-                    }
-                });
-
-            } catch (e) {
-                log.error('Form File Upload Error', {
-                    error: e.toString(),
-                    stack: e.stack,
-                    invoiceId: invoiceId
-                });
-
-                // Redirect back with error
-                redirect.toSuitelet({
-                    scriptId: runtime.getCurrentScript().id,
-                    deploymentId: runtime.getCurrentScript().deploymentId,
-                    parameters: {
-                        error: encodeURIComponent('File Upload Error: ' + e.toString())
-                    }
-                });
-            }
         }
 
         /**
@@ -4690,9 +5863,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-  * Returns JavaScript for the page
-  * UPDATED: Simplified markDisputeUploaded - no prompt, just confirmation
-  */
+ * Returns JavaScript for the page
+ * UPDATED: Simplified confirmation message without box-drawing characters
+ */
         function getJavaScript(scriptUrl) {
             return 'var currentUploadInvoiceId = null;' +
                 'var currentUploadTranId = null;' +
@@ -4788,7 +5961,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    var i = Math.floor(Math.log(bytes) / Math.log(k));' +
                 '    return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + " " + sizes[i];' +
                 '}' +
-                // PHASE 3: Save dispute form with queued files
+                // UPDATED: Simplified confirmation message without box-drawing characters and emojis
                 'function saveDisputeFormWithFiles(invoiceId, responseRecordId) {' +
                 '    var caseNumber = document.getElementById("case-number-" + invoiceId).value;' +
                 '    var coverLetter = document.getElementById("cover-letter-" + invoiceId).value;' +
@@ -4809,26 +5982,49 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '        alert("All required document checkboxes must be checked:\\n\\n• Completed R01E or C01E\\n• Relevant NetSuite Transactions\\n• Return Policy Document");' +
                 '        return;' +
                 '    }' +
+                '    var existingFileCountInput = document.getElementById("existing-file-count-" + invoiceId);' +
+                '    var existingFileCount = existingFileCountInput ? parseInt(existingFileCountInput.value, 10) : 0;' +
                 '    var queuedFileCount = fileQueues[invoiceId] ? fileQueues[invoiceId].length : 0;' +
-                '    var fileSection = document.getElementById("file-upload-section-" + invoiceId);' +
-                '    var existingFileLinks = fileSection ? fileSection.querySelectorAll("a[href*=\\"/app/common/media/mediaitem.nl\\"]") : [];' +
-                '    var totalFiles = queuedFileCount + existingFileLinks.length;' +
+                '    var selectedTransCount = selectedTransactionIds[invoiceId] ? selectedTransactionIds[invoiceId].length : 0;' +
+                '    var totalFiles = queuedFileCount + selectedTransCount + existingFileCount;' +
+                '    console.log("File count validation:", {' +
+                '        existingFileCount: existingFileCount,' +
+                '        queuedFileCount: queuedFileCount,' +
+                '        selectedTransCount: selectedTransCount,' +
+                '        totalFiles: totalFiles' +
+                '    });' +
                 '    if (totalFiles === 0) {' +
-                '        alert("At least one file must be attached or in the queue before saving the dispute form.\\n\\nPlease add files to the queue and try again.");' +
+                '        alert("At least one file must be attached or in the queue before saving the dispute form.\\n\\nPlease add files to the queue or select transactions for PDF generation.");' +
                 '        return;' +
                 '    }' +
-                '    var confirmMsg = "Save dispute form?\\n\\n";' +
-                '    confirmMsg += "• All fields and checkboxes will be updated\\n";' +
+                // UPDATED: Simplified confirmation message
+                '    var confirmMsg = "========================================\\n";' +
+                '    confirmMsg += "SAVE & MERGE DISPUTE FORM CONFIRMATION\\n";' +
+                '    confirmMsg += "========================================\\n\\n";' +
+                '    confirmMsg += "The following documents will be included in your\\n";' +
+                '    confirmMsg += "final merged \\"DISPUTE_SUBMISSION\\" PDF:\\n\\n";' +
+                '    confirmMsg += "1. COVER LETTER (Auto-Generated)\\n";' +
+                '    confirmMsg += "   - Based on your description text\\n";' +
+                '    confirmMsg += "   - Includes Case #" + caseNumber + "\\n\\n";' +
+                '    if (selectedTransCount > 0) {' +
+                '        confirmMsg += "2. NETSUITE TRANSACTIONS (" + selectedTransCount + " PDF" + (selectedTransCount !== 1 ? "s" : "") + ")\\n";' +
+                '        confirmMsg += "   - Auto-generated from selected transactions\\n\\n";' +
+                '    }' +
                 '    if (queuedFileCount > 0) {' +
-                '        confirmMsg += "• " + queuedFileCount + " queued file(s) will be uploaded\\n";' +
+                '        confirmMsg += "3. MANUALLY QUEUED FILES (" + queuedFileCount + " file" + (queuedFileCount !== 1 ? "s" : "") + ")\\n";' +
+                '        confirmMsg += "   - R01E/C01E dispute notifications\\n";' +
+                '        confirmMsg += "   - Delivery photos\\n";' +
+                '        confirmMsg += "   - Correspondence documents\\n\\n";' +
                 '    }' +
-                '    if (existingFileLinks.length > 0) {' +
-                '        confirmMsg += "• " + existingFileLinks.length + " file(s) already attached\\n";' +
+                '    if (existingFileCount > 0) {' +
+                '        confirmMsg += "4. PREVIOUSLY ATTACHED FILES (" + existingFileCount + " file" + (existingFileCount !== 1 ? "s" : "") + ")\\n\\n";' +
                 '    }' +
+                '    confirmMsg += "5. RETURN POLICY (Auto-Attached - Last Page)\\n";' +
+                '    confirmMsg += "   - Automatically included in every submission\\n\\n";' +
                 '    if (!confirm(confirmMsg)) {' +
                 '        return;' +
                 '    }' +
-                '    showLoading("Saving dispute form and uploading files...");' +
+                '    showLoading("Saving dispute form, uploading files, and generating transaction PDFs...");' +
                 '    var form = document.createElement("form");' +
                 '    form.method = "POST";' +
                 '    form.action = "' + scriptUrl + '";' +
@@ -4883,6 +6079,13 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    corrInput.name = "correspondenceChecked";' +
                 '    corrInput.value = correspondenceChecked;' +
                 '    form.appendChild(corrInput);' +
+                '    if (selectedTransactionIds[invoiceId] && selectedTransactionIds[invoiceId].length > 0) {' +
+                '        var transIdsInput = document.createElement("input");' +
+                '        transIdsInput.type = "hidden";' +
+                '        transIdsInput.name = "selectedTransactions";' +
+                '        transIdsInput.value = selectedTransactionIds[invoiceId].join(",");' +
+                '        form.appendChild(transIdsInput);' +
+                '    }' +
                 '    if (fileQueues[invoiceId] && fileQueues[invoiceId].length > 0) {' +
                 '        for (var i = 0; i < fileQueues[invoiceId].length; i++) {' +
                 '            var fileInput = document.createElement("input");' +
@@ -4927,6 +6130,112 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    form.appendChild(invoiceInput);' +
                 '    document.body.appendChild(form);' +
                 '    form.submit();' +
+                '}' +
+                'var selectedTransactionIds = {};' +
+                'function loadCustomerTransactions(invoiceId, responseRecordId) {' +
+                '    var listDiv = document.getElementById("transaction-list-" + invoiceId);' +
+                '    listDiv.innerHTML = "<div style=\\"padding: 10px; text-align: center;\\">Loading transactions...</div>";' +
+                '    listDiv.style.display = "block";' +
+                '    var url = "' + scriptUrl + '&action=loadCustomerTransactions&invoiceId=" + invoiceId;' +
+                '    fetch(url)' +
+                '        .then(function(response) { return response.json(); })' +
+                '        .then(function(data) {' +
+                '            if (!data.success) {' +
+                '                listDiv.innerHTML = "<div style=\\"padding: 10px; color: #dc3545;\\">Error: " + escapeHtmlClient(data.error) + "</div>";' +
+                '                return;' +
+                '            }' +
+                '            displayTransactionList(invoiceId, data.transactions);' +
+                '        })' +
+                '        .catch(function(error) {' +
+                '            listDiv.innerHTML = "<div style=\\"padding: 10px; color: #dc3545;\\">Error loading transactions: " + error + "</div>";' +
+                '        });' +
+                '}' +
+                // UPDATED: displayTransactionList with chargeback indicators
+                'function displayTransactionList(invoiceId, transactions) {' +
+                '    var listDiv = document.getElementById("transaction-list-" + invoiceId);' +
+                '    if (!transactions || transactions.length === 0) {' +
+                '        listDiv.innerHTML = "<div style=\\"padding: 10px; color: #666; font-style: italic;\\">No transactions found</div>";' +
+                '        return;' +
+                '    }' +
+                '    if (!selectedTransactionIds[invoiceId]) {' +
+                '        selectedTransactionIds[invoiceId] = [];' +
+                '    }' +
+                '    var html = "<div style=\\"padding: 8px; background-color: #f0f8ff; border-bottom: 1px solid #2196F3; font-weight: bold; font-size: 11px;\\">Select transactions to generate PDFs (" + transactions.length + " available - sorted oldest to newest)</div>";' +
+                '    for (var i = 0; i < transactions.length; i++) {' +
+                '        var trans = transactions[i];' +
+                '        var isChecked = selectedTransactionIds[invoiceId].indexOf(trans.id) !== -1;' +
+                '        ' +
+                '        var chargebackLabel = "";' +
+                '        var bgColor = "white";' +
+                '        var borderColor = "#eee";' +
+                '        ' +
+                '        if (trans.hasCCDispute && trans.hasFraud) {' +
+                '            chargebackLabel = " <span style=\\"color: #dc3545; font-weight: bold; font-size: 10px;\\">[DISPUTE + FRAUD]</span>";' +
+                '            bgColor = "#fff5f5";' +
+                '            borderColor = "#dc3545";' +
+                '        } else if (trans.hasFraud) {' +
+                '            chargebackLabel = " <span style=\\"color: #dc3545; font-weight: bold; font-size: 10px;\\">[FRAUD CHARGEBACK]</span>";' +
+                '            bgColor = "#fff5f5";' +
+                '            borderColor = "#dc3545";' +
+                '        } else if (trans.hasCCDispute) {' +
+                '            chargebackLabel = " <span style=\\"color: #f44336; font-weight: bold; font-size: 10px;\\">[DISPUTE CHARGEBACK]</span>";' +
+                '            bgColor = "#fff9e6";' +
+                '            borderColor = "#f44336";' +
+                '        }' +
+                '        ' +
+                '        html += "<div style=\\"padding: 8px;" + borderColor + "; border-left: 3px solid " + borderColor + "; display: flex; align-items: center; background-color: " + bgColor + ";\\">";' +
+                '        html += "<input type=\\"checkbox\\" id=\\"trans-" + invoiceId + "-" + trans.id + "\\" ";' +
+                '        html += "onchange=\\"toggleTransactionSelection(\'" + invoiceId + "\', \'" + trans.id + "\', this.checked)\\" ";' +
+                '        html += "style=\\"margin-right: 8px; width: 16px; height: 16px;\\"" + (isChecked ? " checked" : "") + " />";' +
+                '        html += "<label for=\\"trans-" + invoiceId + "-" + trans.id + "\\" style=\\"flex: 1; cursor: pointer; font-size: 11px;\\">";' +
+                '        html += "<strong>" + escapeHtmlClient(trans.typeLabel) + "</strong> ";' +
+                '        html += "<a href=\\"/app/accounting/transactions/transaction.nl?id=" + trans.id + "\\" target=\\"_blank\\" ";' +
+                '        html += "onclick=\\"event.stopPropagation();\\">" + escapeHtmlClient(trans.tranid) + "</a>";' +
+                '        html += chargebackLabel;' +
+                '        html += " | " + escapeHtmlClient(trans.date);' +
+                '        html += " | $" + parseFloat(trans.amount).toFixed(2);' +
+                '        html += " | " + escapeHtmlClient(trans.status);' +
+                '        html += "</label>";' +
+                '        html += "</div>";' +
+                '    }' +
+                '    html += "<div style=\\"padding: 8px; background-color: #f0f8ff; border-top: 1px solid #2196F3; font-size: 11px;\\">";' +
+                '    html += "<span id=\\"selected-count-" + invoiceId + "\\">0 transactions selected</span>";' +
+                '    html += "</div>";' +
+                '    listDiv.innerHTML = html;' +
+                '    updateSelectedTransactionCount(invoiceId);' +
+                '}' +
+                'function toggleTransactionSelection(invoiceId, transId, isChecked) {' +
+                '    if (!selectedTransactionIds[invoiceId]) {' +
+                '        selectedTransactionIds[invoiceId] = [];' +
+                '    }' +
+                '    var index = selectedTransactionIds[invoiceId].indexOf(transId);' +
+                '    if (isChecked && index === -1) {' +
+                '        selectedTransactionIds[invoiceId].push(transId);' +
+                '    } else if (!isChecked && index !== -1) {' +
+                '        selectedTransactionIds[invoiceId].splice(index, 1);' +
+                '    }' +
+                '    updateSelectedTransactionCount(invoiceId);' +
+                '    updateNetSuiteTransCheckbox(invoiceId);' +
+                '}' +
+                'function updateSelectedTransactionCount(invoiceId) {' +
+                '    var countSpan = document.getElementById("selected-count-" + invoiceId);' +
+                '    if (countSpan && selectedTransactionIds[invoiceId]) {' +
+                '        var count = selectedTransactionIds[invoiceId].length;' +
+                '        countSpan.textContent = count + " transaction" + (count !== 1 ? "s" : "") + " selected";' +
+                '        if (count > 0) {' +
+                '            countSpan.style.fontWeight = "bold";' +
+                '            countSpan.style.color = "#28a745";' +
+                '        } else {' +
+                '            countSpan.style.fontWeight = "normal";' +
+                '            countSpan.style.color = "#333";' +
+                '        }' +
+                '    }' +
+                '}' +
+                'function updateNetSuiteTransCheckbox(invoiceId) {' +
+                '    var checkbox = document.getElementById("netsuite-trans-checkbox-" + invoiceId);' +
+                '    if (checkbox && selectedTransactionIds[invoiceId] && selectedTransactionIds[invoiceId].length > 0) {' +
+                '        checkbox.checked = true;' +
+                '    }' +
                 '}' +
                 'function toggleSubmissionChecklist(invoiceId, responseRecordId) {' +
                 '    var checklistRow = document.getElementById("checklist-" + invoiceId);' +
