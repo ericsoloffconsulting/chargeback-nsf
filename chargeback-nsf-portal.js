@@ -4110,9 +4110,10 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
   * @returns {Array} Array of invoice objects with response record info
   */
         function searchChargebacksNeedingDisputeFiles() {
-            log.debug('Searching Chargebacks Needing Dispute Files', 'Items: 304416 (CC Dispute), 304429 (Fraud), 304779 (Dup FreedomPay)');
+            log.debug('Searching Chargebacks Needing Dispute Files', 'Items: 304416 (CC Dispute), 304429 (Fraud)');
 
             // STEP 1: Search for invoices with the chargeback items (line level search)
+            // NOTE: 304779 (Duplicate FreedomPay Refund) excluded - no dispute response needed
             var itemSearch = search.create({
                 type: search.Type.INVOICE,
                 filters: [
@@ -4120,7 +4121,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     'AND',
                     ['mainline', 'is', 'F'],
                     'AND',
-                    ['item', 'anyof', ['304416', '304429', '304779']]
+                    ['item', 'anyof', ['304416', '304429']]
                 ],
                 columns: [
                     'internalid'
@@ -4402,11 +4403,12 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
                 for (var i = 0; i < invoices.length; i++) {
                     var inv = invoices[i];
+                    var reverseButtonText = (inv.itemId === '304779') ? 'Reverse Duplicate Refund' : 'Reverse Chargeback';
                     html += '<tr>';
                     html += '<td class="action-cell">';
                     html += '<button type="button" class="action-btn payment-link-btn" onclick="sendPaymentLink(\'' + inv.id + '\', \'' + escapeHtml(inv.tranid) + '\')">Send Payment Link</button>';
                     html += '<button type="button" class="action-btn manual-payment-btn" onclick="enterManualPayment(\'' + inv.id + '\')">Enter Manual Payment</button>';
-                    html += '<button type="button" class="action-btn reverse-btn" onclick="reverseChargeback(\'' + inv.id + '\', \'' + escapeHtml(inv.tranid) + '\')">Reverse Chargeback</button>';
+                    html += '<button type="button" class="action-btn reverse-btn" onclick="reverseChargeback(\'' + inv.id + '\', \'' + escapeHtml(inv.tranid) + '\')">' + reverseButtonText + '</button>';
                     html += '<button type="button" class="action-btn writeoff-btn" onclick="jeWriteOff(\'' + inv.id + '\')">JE Write Off</button>';
                     html += '</td>';
                     html += '<td>' + escapeHtml(inv.customer) + '</td>';
@@ -4432,7 +4434,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
  * @returns {Array} Array of invoice objects
  */
         function searchOpenChargebackInvoices() {
-            log.debug('Searching Open Chargeback Invoices', 'Items: 304416 (CC Dispute), 304429 (Fraud), 304417 (NSF)');
+            log.debug('Searching Open Chargeback Invoices', 'Items: 304416 (CC Dispute), 304429 (Fraud), 304417 (NSF), 304779 (Dup FreedomPay)');
 
             var invoiceSearch = search.create({
                 type: search.Type.INVOICE,
@@ -4443,7 +4445,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     'AND',
                     ['mainline', 'is', 'F'],
                     'AND',
-                    ['item', 'anyof', ['304416', '304429', '304417']] // CC Dispute, Fraud, and NSF items
+                    ['item', 'anyof', ['304416', '304429', '304417', '304779']] // UPDATED: Added 304779
                 ],
                 columns: [
                     search.createColumn({ name: 'tranid', sort: search.Sort.DESC }),
@@ -4471,6 +4473,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         itemType = 'Fraud Chargeback';
                     } else if (itemId === '304417') {
                         itemType = 'NSF Check';
+                    } else if (itemId === '304779') {
+                        itemType = 'Duplicate FreedomPay Refund';
                     }
 
                     var createdBy = result.getText('createdby') || 'Unknown';
@@ -4482,6 +4486,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         dateCreated: result.getValue('datecreated'),
                         amount: result.getValue('amount'),
                         type: itemType,
+                        itemId: itemId,
                         createdBy: createdBy
                     });
 
