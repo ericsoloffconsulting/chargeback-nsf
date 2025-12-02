@@ -4360,11 +4360,21 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             var newInvoiceTranId = params.invoiceTranId || newInvoiceId; // Fallback to ID if tranid not available
             var jeId = params.jeId || '';
             var jeTranId = params.jeTranId || '';
+            var multipleProcessed = params.multipleProcessed || '';
+            var invoiceCount = params.invoiceCount || '';
 
             var typeText = type === 'nsf' ? 'NSF Check' : (type === 'fraud' ? 'Fraud Chargeback' : 'Dispute Chargeback');
 
             var html = '<div class="success-msg">';
-            html += '<strong>' + typeText + ' Processed Successfully for ' + escapeHtml(customer) + '</strong><br>';
+
+            // Check if this is a multiple invoice process
+            if (multipleProcessed === 'true' && invoiceCount) {
+                html += '<strong>' + typeText + ' Processed Successfully for ' + invoiceCount + ' Combined Invoices</strong><br>';
+                html += '<em>Customer: ' + escapeHtml(customer) + '</em><br><br>';
+            } else {
+                html += '<strong>' + typeText + ' Processed Successfully for ' + escapeHtml(customer) + '</strong><br>';
+            }
+
             html += 'Credit Memo: <a href="/app/accounting/transactions/custcred.nl?id=' + creditMemoId + '" target="_blank">' + escapeHtml(creditMemoTranId) + '</a><br>';
             html += 'Customer Refund: <a href="/app/accounting/transactions/custrfnd.nl?id=' + refundId + '" target="_blank">' + escapeHtml(refundTranId) + '</a><br>';
             html += 'New Invoice: <a href="/app/accounting/transactions/custinvc.nl?id=' + newInvoiceId + '" target="_blank">' + escapeHtml(newInvoiceTranId) + '</a>';
@@ -4542,6 +4552,12 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     return;
                 }
 
+                // Handle multiple invoice processing
+                if (params.action === 'processMultiple') {
+                    handleProcessMultiple(context);
+                    return;
+                }
+
                 // Handle chargeback/NSF processing
                 var action = params.action;
                 var invoiceId = params.invoiceId;
@@ -4587,6 +4603,76 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     deploymentId: runtime.getCurrentScript().deploymentId,
                     parameters: {
                         error: encodeURIComponent(e.toString())
+                    }
+                });
+            }
+        }
+
+        /**
+         * NEW: Handles processing multiple invoices as a single combined transaction
+         * @param {Object} context
+         */
+        function handleProcessMultiple(context) {
+            var request = context.request;
+            var params = request.parameters;
+            var invoiceIds = params.invoiceIds;
+            var type = params.type;
+            var partialAmountsJson = params.partialAmounts;
+
+            log.audit('Process Multiple Invoices Request', {
+                invoiceIds: invoiceIds,
+                type: type,
+                partialAmountsJson: partialAmountsJson
+            });
+
+            try {
+                if (!invoiceIds || !type) {
+                    throw new Error('Invoice IDs and type are required');
+                }
+
+                var invoiceIdArray = invoiceIds.split(',');
+                var partialAmounts = {};
+
+                if (partialAmountsJson) {
+                    try {
+                        partialAmounts = JSON.parse(partialAmountsJson);
+                    } catch (e) {
+                        log.error('Error parsing partial amounts JSON', e.toString());
+                    }
+                }
+
+                var result = processMultipleChargebackOrNsf(invoiceIdArray, type, partialAmounts);
+
+                redirect.toSuitelet({
+                    scriptId: runtime.getCurrentScript().id,
+                    deploymentId: runtime.getCurrentScript().deploymentId,
+                    parameters: {
+                        success: 'true',
+                        type: type,
+                        customer: encodeURIComponent(result.customerName),
+                        cm: result.creditMemoId,
+                        cmTranId: result.creditMemoTranId,
+                        refund: result.refundId,
+                        refundTranId: result.refundTranId,
+                        invoice: result.newInvoiceId,
+                        invoiceTranId: result.newInvoiceTranId,
+                        multipleProcessed: 'true',
+                        invoiceCount: invoiceIdArray.length.toString()
+                    }
+                });
+
+            } catch (e) {
+                log.error('Process Multiple Error', {
+                    error: e.toString(),
+                    stack: e.stack,
+                    invoiceIds: invoiceIds
+                });
+
+                redirect.toSuitelet({
+                    scriptId: runtime.getCurrentScript().id,
+                    deploymentId: runtime.getCurrentScript().deploymentId,
+                    parameters: {
+                        error: encodeURIComponent('Process Multiple Error: ' + e.toString())
                     }
                 });
             }
@@ -5667,6 +5753,409 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
+         * NEW: Processes multiple invoices as a single combined chargeback/NSF transaction
+         * @param {Array} invoiceIds - Array of invoice internal IDs
+         * @param {string} type - Transaction type (chargeback, fraud, or nsf)
+         * @param {Object} partialAmounts - Object mapping invoice IDs to partial amounts
+         * @returns {Object} Result with created record details
+         */
+        function processMultipleChargebackOrNsf(invoiceIds, type, partialAmounts) {
+            log.audit('Process Multiple Invoices - START', {
+                invoiceIds: invoiceIds,
+                type: type,
+                count: invoiceIds.length,
+                hasPartialAmounts: Object.keys(partialAmounts || {}).length > 0
+            });
+
+            if (!invoiceIds || invoiceIds.length === 0) {
+                throw new Error('No invoice IDs provided');
+            }
+
+            // Determine item ID, memo text, and checkbox field based on type
+            var itemId;
+            var memoText;
+            var checkboxField;
+
+            if (type === 'nsf') {
+                itemId = '304417';
+                memoText = 'NSF Check';
+                checkboxField = 'custbody_bas_nsf_check';
+            } else if (type === 'fraud') {
+                itemId = '304429';
+                memoText = 'Fraud Chargeback';
+                checkboxField = 'custbody_bas_fraud';
+            } else {
+                itemId = '304416';
+                memoText = 'Credit Card Chargeback';
+                checkboxField = 'custbody_bas_cc_dispute';
+            }
+
+            // Load first invoice to get customer and other details
+            var firstInvoice = record.load({
+                type: record.Type.INVOICE,
+                id: invoiceIds[0]
+            });
+
+            var customerId = firstInvoice.getValue('entity');
+            var customerName = firstInvoice.getText('entity');
+            var department = firstInvoice.getValue('department');
+            var subsidiary = firstInvoice.getValue('subsidiary');
+            var classField = firstInvoice.getValue('class');
+
+            // Calculate total amount and collect invoice tranids
+            var totalAmount = 0;
+            var invoiceTranIds = [];
+
+            for (var i = 0; i < invoiceIds.length; i++) {
+                var invId = invoiceIds[i];
+                var inv = record.load({
+                    type: record.Type.INVOICE,
+                    id: invId,
+                    isDynamic: false
+                });
+
+                var invTranId = inv.getValue('tranid');
+                invoiceTranIds.push(invTranId);
+
+                var fullAmount = inv.getValue('total');
+                var amountToUse = fullAmount;
+
+                // Check for partial amount
+                if (partialAmounts && partialAmounts[invId]) {
+                    var partial = parseFloat(partialAmounts[invId]);
+                    if (!isNaN(partial) && partial > 0 && partial <= fullAmount) {
+                        amountToUse = partial;
+                    }
+                }
+
+                totalAmount += amountToUse;
+
+                log.debug('Invoice Loaded', {
+                    invoiceId: invId,
+                    tranId: invTranId,
+                    fullAmount: fullAmount,
+                    amountUsed: amountToUse
+                });
+            }
+
+            log.debug('Combined Total Calculated', {
+                totalAmount: totalAmount,
+                invoiceCount: invoiceIds.length
+            });
+
+            // Lookup fulfilling location
+            var location = null;
+            if (department) {
+                location = lookupFulfillingLocation(department);
+                log.debug('Location Lookup Complete', 'Department: ' + department + ' | Location: ' + location);
+            }
+
+            // Step 1: Create ONE Credit Memo
+            var creditMemo = record.transform({
+                fromType: record.Type.INVOICE,
+                fromId: invoiceIds[0],
+                toType: record.Type.CREDIT_MEMO,
+                isDynamic: true
+            });
+
+            creditMemo.setValue('tobeemailed', false);
+
+            if (location) {
+                creditMemo.setValue('location', location);
+            }
+
+            if (department) {
+                creditMemo.setValue('department', department);
+            }
+
+            // Remove all lines and add single line with combined amount
+            var lineCount = creditMemo.getLineCount({ sublistId: 'item' });
+            for (var i = lineCount - 1; i >= 0; i--) {
+                creditMemo.removeLine({
+                    sublistId: 'item',
+                    line: i
+                });
+            }
+
+            creditMemo.selectNewLine({ sublistId: 'item' });
+            creditMemo.setCurrentSublistValue({
+                sublistId: 'item',
+                fieldId: 'item',
+                value: itemId
+            });
+            creditMemo.setCurrentSublistValue({
+                sublistId: 'item',
+                fieldId: 'amount',
+                value: totalAmount
+            });
+
+            if (location) {
+                creditMemo.setCurrentSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'location',
+                    value: location
+                });
+            }
+
+            if (department) {
+                creditMemo.setCurrentSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'department',
+                    value: department
+                });
+            }
+
+            if (classField) {
+                creditMemo.setCurrentSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'class',
+                    value: classField
+                });
+            }
+
+            creditMemo.commitLine({ sublistId: 'item' });
+
+            var creditMemoMemo = memoText + ' - COMBINED: ' + invoiceTranIds.join(', ');
+            creditMemo.setValue('memo', creditMemoMemo);
+
+            var creditMemoId = creditMemo.save();
+            log.audit('Combined Credit Memo Created', {
+                id: creditMemoId,
+                amount: totalAmount,
+                invoiceCount: invoiceIds.length
+            });
+
+            var creditMemoRecord = record.load({
+                type: record.Type.CREDIT_MEMO,
+                id: creditMemoId,
+                isDynamic: false
+            });
+            var creditMemoTranId = creditMemoRecord.getValue('tranid');
+
+            // Step 2: Create ONE Customer Refund
+            var customerRefund = record.create({
+                type: record.Type.CUSTOMER_REFUND,
+                isDynamic: true
+            });
+
+            customerRefund.setValue('customer', customerId);
+            customerRefund.setValue('paymentmethod', '15');
+
+            var refundMemo = memoText + ' - COMBINED';
+            customerRefund.setValue('memo', refundMemo);
+
+            var refundPrefix = type === 'nsf' ? 'NSF_CHECK' : (type === 'fraud' ? 'FRAUD_CC' : 'CHARGEBACK_CC');
+            var customTranId = refundPrefix + '_COMBINED_' + invoiceTranIds[0];
+
+            customerRefund.setValue('tranid', customTranId);
+
+            try {
+                customerRefund.setValue({
+                    fieldId: 'custbody_bas_refunded_transaction',
+                    value: creditMemoId
+                });
+            } catch (e) {
+                log.error('Error Setting Refunded Transaction', 'Error: ' + e.message);
+            }
+
+            customerRefund.setValue('total', totalAmount);
+
+            var applyLineCount = customerRefund.getLineCount({ sublistId: 'apply' });
+
+            for (var j = 0; j < applyLineCount; j++) {
+                var applyInternalId = customerRefund.getSublistValue({
+                    sublistId: 'apply',
+                    fieldId: 'internalid',
+                    line: j
+                });
+
+                if (applyInternalId == creditMemoId) {
+                    customerRefund.selectLine({
+                        sublistId: 'apply',
+                        line: j
+                    });
+                    customerRefund.setCurrentSublistValue({
+                        sublistId: 'apply',
+                        fieldId: 'apply',
+                        value: true
+                    });
+                    customerRefund.setCurrentSublistValue({
+                        sublistId: 'apply',
+                        fieldId: 'amount',
+                        value: totalAmount
+                    });
+                    customerRefund.commitLine({ sublistId: 'apply' });
+                    log.debug('Applied to Credit Memo', 'Line: ' + j + ' | Amount: ' + totalAmount);
+                    break;
+                }
+            }
+
+            var refundId = customerRefund.save();
+            log.audit('Combined Customer Refund Created', {
+                id: refundId,
+                amount: totalAmount
+            });
+
+            var refundTranId = customTranId;
+
+            // Step 3: Create ONE new invoice
+            var newInvoice = record.copy({
+                type: record.Type.INVOICE,
+                id: invoiceIds[0],
+                isDynamic: true
+            });
+
+            newInvoice.setValue('trandate', new Date());
+            newInvoice.setValue('tobeemailed', false);
+            newInvoice.setValue('custbody_b4cp_gen_pay_online_link', true);
+
+            if (location) {
+                newInvoice.setValue('location', location);
+            }
+
+            if (department) {
+                newInvoice.setValue('department', department);
+            }
+
+            var newInvLineCount = newInvoice.getLineCount({ sublistId: 'item' });
+            for (var k = newInvLineCount - 1; k >= 0; k--) {
+                newInvoice.removeLine({
+                    sublistId: 'item',
+                    line: k
+                });
+            }
+
+            newInvoice.selectNewLine({ sublistId: 'item' });
+            newInvoice.setCurrentSublistValue({
+                sublistId: 'item',
+                fieldId: 'item',
+                value: itemId
+            });
+            newInvoice.setCurrentSublistValue({
+                sublistId: 'item',
+                fieldId: 'amount',
+                value: totalAmount
+            });
+
+            if (location) {
+                newInvoice.setCurrentSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'location',
+                    value: location
+                });
+            }
+
+            if (department) {
+                newInvoice.setCurrentSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'department',
+                    value: department
+                });
+            }
+
+            if (classField) {
+                newInvoice.setCurrentSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'class',
+                    value: classField
+                });
+            }
+
+            newInvoice.commitLine({ sublistId: 'item' });
+
+            var newInvoiceMemo = memoText + ' - COMBINED: ' + invoiceTranIds.join(', ');
+            newInvoice.setValue('memo', newInvoiceMemo);
+
+            var newInvoiceId = newInvoice.save();
+            log.audit('Combined New Invoice Created', {
+                id: newInvoiceId,
+                amount: totalAmount
+            });
+
+            var newInvoiceRecord = record.load({
+                type: record.Type.INVOICE,
+                id: newInvoiceId,
+                isDynamic: false
+            });
+            var newInvoiceTranId = newInvoiceRecord.getValue('tranid');
+
+            // Step 4: Update ALL original invoices
+            var memoPrefix = type === 'nsf' ? 'NSF CHECK, SEE' : (type === 'fraud' ? 'FRAUD CHARGEBACK, SEE' : 'CHARGEBACK, SEE');
+
+            for (var i = 0; i < invoiceIds.length; i++) {
+                try {
+                    var invId = invoiceIds[i];
+                    var originalInvoiceForUpdate = record.load({
+                        type: record.Type.INVOICE,
+                        id: invId,
+                        isDynamic: false
+                    });
+
+                    var existingMemo = originalInvoiceForUpdate.getValue('memo') || '';
+                    var originalTranId = originalInvoiceForUpdate.getValue('tranid');
+
+                    // Build list of other combined invoices
+                    var otherInvoices = [];
+                    for (var k = 0; k < invoiceTranIds.length; k++) {
+                        if (invoiceTranIds[k] !== originalTranId) {
+                            otherInvoices.push(invoiceTranIds[k]);
+                        }
+                    }
+
+                    var newMemoText = memoPrefix + ' ' + newInvoiceTranId + ' AND ' + creditMemoTranId;
+                    if (otherInvoices.length > 0) {
+                        newMemoText += ' (COMBINED WITH: ' + otherInvoices.join(', ') + ')';
+                    }
+
+                    var updateMemo = existingMemo ? existingMemo + ' - ' + newMemoText : newMemoText;
+
+                    var updateValues = {
+                        memo: updateMemo
+                    };
+                    updateValues[checkboxField] = true;
+
+                    record.submitFields({
+                        type: record.Type.INVOICE,
+                        id: invId,
+                        values: updateValues
+                    });
+
+                    log.audit('Original Invoice Updated', {
+                        invoiceId: invId,
+                        tranId: originalTranId,
+                        newMemo: updateMemo,
+                        checkboxField: checkboxField
+                    });
+
+                } catch (updateError) {
+                    log.error('Error Updating Original Invoice', {
+                        error: updateError.toString(),
+                        stack: updateError.stack,
+                        invoiceId: invId
+                    });
+                }
+            }
+
+            log.audit('Process Multiple Invoices - COMPLETE', {
+                invoiceCount: invoiceIds.length,
+                totalAmount: totalAmount,
+                creditMemoId: creditMemoId,
+                refundId: refundId,
+                newInvoiceId: newInvoiceId
+            });
+
+            return {
+                creditMemoId: creditMemoId,
+                creditMemoTranId: creditMemoTranId,
+                refundId: refundId,
+                refundTranId: refundTranId,
+                newInvoiceId: newInvoiceId,
+                newInvoiceTranId: newInvoiceTranId,
+                customerName: customerName
+            };
+        }
+
+        /**
          * Looks up the fulfilling location from a department record
          * @param {number} departmentId - The department (selling location) internal ID
          * @returns {number} The fulfilling location internal ID
@@ -5723,23 +6212,29 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-  * Returns CSS styles for the page
-  * UPDATED: Added styles for submission checklist
-  * UPDATED: Repositioned SOP Quick Link within container
-  * @returns {string} CSS content
-  */
+   * Returns CSS styles for the page
+   * UPDATED: Added styles for toggle switch
+   */
         function getStyles() {
             return '.uir-page-title-secondline { border: none !important; margin: 0 !important; padding: 0 !important; }' +
                 '.uir-record-type { border: none !important; }' +
                 '.bglt { border: none !important; }' +
                 '.smalltextnolink { border: none !important; }' +
                 '.chargeback-container { margin: 0; padding: 20px; border: none; background: transparent; position: relative; }' +
-                // UPDATED: SOP Quick Link styles - absolute within container instead of fixed
                 '.sop-link-container { position: absolute; top: 0; right: 0; z-index: 100; }' +
                 '.sop-quick-link { display: inline-flex; align-items: center; padding: 10px 18px; background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%); color: white; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 13px; box-shadow: 0 4px 6px rgba(76, 175, 80, 0.3), 0 1px 3px rgba(0, 0, 0, 0.1); transition: all 0.3s ease; border: 2px solid rgba(255, 255, 255, 0.2); }' +
                 '.sop-quick-link:hover { background: linear-gradient(135deg, #45a049 0%, #4CAF50 100%); transform: translateY(-2px); box-shadow: 0 6px 12px rgba(76, 175, 80, 0.4), 0 2px 4px rgba(0, 0, 0, 0.15); text-decoration: none; color: white; border-color: rgba(255, 255, 255, 0.3); }' +
                 '.sop-quick-link:active { transform: translateY(0px); box-shadow: 0 2px 4px rgba(76, 175, 80, 0.3), 0 1px 2px rgba(0, 0, 0, 0.1); }' +
                 '.sop-quick-link svg { filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.2)); }' +
+                // NEW: Toggle switch styles
+                '.toggle-container { display: flex; align-items: center; margin-bottom: 15px; padding: 10px; background-color: #f8f9fa; border-radius: 6px; border: 1px solid #dee2e6; }' +
+                '.toggle-switch { position: relative; display: inline-block; width: 50px; height: 24px; margin-right: 12px; }' +
+                '.toggle-switch input { opacity: 0; width: 0; height: 0; }' +
+                '.toggle-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 24px; }' +
+                '.toggle-slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: white; transition: .4s; border-radius: 50%; }' +
+                'input:checked + .toggle-slider { background-color: #007bff; }' +
+                'input:checked + .toggle-slider:before { transform: translateX(26px); }' +
+                '.toggle-label { font-size: 14px; font-weight: 600; color: #333; cursor: pointer; user-select: none; }' +
                 'table.search-table { border-collapse: collapse; width: 100%; margin: 15px 0; border: 1px solid #ddd; background: white; }' +
                 'table.search-table th, table.search-table td { border: 1px solid #ddd; padding: 8px; text-align: left; vertical-align: top; }' +
                 'table.search-table th { background-color: #f8f9fa; font-weight: bold; color: #333; font-size: 12px; }' +
@@ -5799,6 +6294,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 'var fileQueues = {};' +
                 // NEW: Partial amount storage - keyed by invoice ID
                 'var partialAmounts = {};' +
+                // NEW: Multi-select mode tracking
+                'var selectedInvoices = {};' +
+                'var multiSelectMode = false;' +
                 'function refreshPage() { window.location.reload(); }' +
                 'function showLoading(message) {' +
                 '    var overlay = document.getElementById("loadingOverlay");' +
@@ -5888,6 +6386,109 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    var sizes = ["B", "KB", "MB", "GB"];' +
                 '    var i = Math.floor(Math.log(bytes) / Math.log(k));' +
                 '    return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + " " + sizes[i];' +
+                '}' +
+                // UPDATED: toggleMultiSelect to work with checkbox
+                'function toggleMultiSelect() {' +
+                '    var checkbox = document.getElementById("multi-select-checkbox");' +
+                '    multiSelectMode = checkbox.checked;' +
+                '    var checkboxes = document.querySelectorAll(".invoice-checkbox");' +
+                '    var actionButtons = document.querySelectorAll(".invoice-action-buttons");' +
+                '    var multiSummary = document.getElementById("multi-select-summary");' +
+                '    if (multiSelectMode) {' +
+                '        for (var i = 0; i < checkboxes.length; i++) {' +
+                '            checkboxes[i].style.display = "table-cell";' +
+                '        }' +
+                '        for (var j = 0; j < actionButtons.length; j++) {' +
+                '            actionButtons[j].style.opacity = "0.5";' +
+                '            actionButtons[j].style.pointerEvents = "none";' +
+                '        }' +
+                '        if (multiSummary) multiSummary.style.display = "block";' +
+                '    } else {' +
+                '        for (var i = 0; i < checkboxes.length; i++) {' +
+                '            checkboxes[i].style.display = "none";' +
+                '        }' +
+                '        for (var j = 0; j < actionButtons.length; j++) {' +
+                '            actionButtons[j].style.opacity = "1";' +
+                '            actionButtons[j].style.pointerEvents = "auto";' +
+                '        }' +
+                '        if (multiSummary) multiSummary.style.display = "none";' +
+                '        selectedInvoices = {};' +
+                '        var allCheckboxInputs = document.querySelectorAll(".invoice-checkbox-input");' +
+                '        for (var k = 0; k < allCheckboxInputs.length; k++) {' +
+                '            allCheckboxInputs[k].checked = false;' +
+                '        }' +
+                '    }' +
+                '    updateRunningTotal();' +
+                '}' +
+                // NEW: Toggle individual invoice selection
+                'function toggleInvoiceSelection(invoiceId, originalAmount) {' +
+                '    var checkbox = document.getElementById("checkbox-" + invoiceId);' +
+                '    if (checkbox.checked) {' +
+                '        var amountToUse = partialAmounts[invoiceId] || originalAmount;' +
+                '        selectedInvoices[invoiceId] = parseFloat(amountToUse);' +
+                '    } else {' +
+                '        delete selectedInvoices[invoiceId];' +
+                '    }' +
+                '    updateRunningTotal();' +
+                '}' +
+                // NEW: Update running total display
+                'function updateRunningTotal() {' +
+                '    var totalElement = document.getElementById("running-total");' +
+                '    if (!totalElement) return;' +
+                '    var total = 0;' +
+                '    for (var invoiceId in selectedInvoices) {' +
+                '        if (selectedInvoices.hasOwnProperty(invoiceId)) {' +
+                '            total += selectedInvoices[invoiceId];' +
+                '        }' +
+                '    }' +
+                '    var count = Object.keys(selectedInvoices).length;' +
+                '    totalElement.innerHTML = "<strong>Selected: " + count + " invoice(s) | Total: <span style=\\"color: #28a745;\\">$" + total.toFixed(2) + "</span></strong>";' +
+                '}' +
+                // NEW: Process multiple invoices
+                'function processMultipleInvoices(type) {' +
+                '    var invoiceIds = Object.keys(selectedInvoices);' +
+                '    if (invoiceIds.length === 0) {' +
+                '        alert("Please select at least one invoice");' +
+                '        return;' +
+                '    }' +
+                '    var typeText = type === "nsf" ? "NSF Check" : (type === "fraud" ? "Fraud Chargeback" : "Dispute Chargeback");' +
+                '    var total = 0;' +
+                '    for (var i = 0; i < invoiceIds.length; i++) {' +
+                '        total += selectedInvoices[invoiceIds[i]];' +
+                '    }' +
+                '    var confirmMsg = "Process " + typeText + " for " + invoiceIds.length + " invoice(s)?\\n\\n";' +
+                '    confirmMsg += "Total Amount: $" + total.toFixed(2) + "\\n\\n";' +
+                '    confirmMsg += "This will create ONE combined transaction for all selected invoices.";' +
+                '    if (!confirm(confirmMsg)) {' +
+                '        return;' +
+                '    }' +
+                '    showLoading("Processing " + typeText + " for " + invoiceIds.length + " invoices...");' +
+                '    var form = document.createElement("form");' +
+                '    form.method = "POST";' +
+                '    form.action = "' + scriptUrl + '";' +
+                '    var actionInput = document.createElement("input");' +
+                '    actionInput.type = "hidden";' +
+                '    actionInput.name = "action";' +
+                '    actionInput.value = "processMultiple";' +
+                '    form.appendChild(actionInput);' +
+                '    var typeInput = document.createElement("input");' +
+                '    typeInput.type = "hidden";' +
+                '    typeInput.name = "type";' +
+                '    typeInput.value = type;' +
+                '    form.appendChild(typeInput);' +
+                '    var idsInput = document.createElement("input");' +
+                '    idsInput.type = "hidden";' +
+                '    idsInput.name = "invoiceIds";' +
+                '    idsInput.value = invoiceIds.join(",");' +
+                '    form.appendChild(idsInput);' +
+                '    var amountsJson = JSON.stringify(partialAmounts);' +
+                '    var amountsInput = document.createElement("input");' +
+                '    amountsInput.type = "hidden";' +
+                '    amountsInput.name = "partialAmounts";' +
+                '    amountsInput.value = amountsJson;' +
+                '    form.appendChild(amountsInput);' +
+                '    document.body.appendChild(form);' +
+                '    form.submit();' +
                 '}' +
                 // UPDATED: Simplified confirmation message without box-drawing characters and emojis
                 'function saveDisputeFormWithFiles(invoiceId, responseRecordId) {' +
@@ -6456,13 +7057,27 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    }' +
                 '    document.getElementById("invoiceResults").innerHTML = html;' +
                 '}' +
+                // UPDATED: buildInvoicesTable with toggle switch
                 'function buildInvoicesTable(invoices) {' +
-                '    var html = "<table class=\\"search-table\\">";' +
-                '    html += "<thead><tr><th>Action</th><th>Invoice #</th><th>Date</th><th>Amount</th><th>Memo</th></tr></thead><tbody>";' +
+                '    var html = "";' +
+                '    html += "<div class=\\"toggle-container\\">";' +
+                '    html += "<label class=\\"toggle-switch\\">";' +
+                '    html += "<input type=\\"checkbox\\" id=\\"multi-select-checkbox\\" onchange=\\"toggleMultiSelect()\\">";' +
+                '    html += "<span class=\\"toggle-slider\\"></span>";' +
+                '    html += "</label>";' +
+                '    html += "<label for=\\"multi-select-checkbox\\" class=\\"toggle-label\\">Select Multiple Invoices</label>";' +
+                '    html += "</div>";' +
+                '    html += "<table class=\\"search-table\\">";' +
+                '    html += "<thead><tr><th class=\\"invoice-checkbox\\" style=\\"display: none; width: 40px;\\"></th><th>Action</th><th>Invoice #</th><th>Date</th><th>Amount</th><th>Memo</th></tr></thead><tbody>";' +
                 '    for (var i = 0; i < invoices.length; i++) {' +
                 '        var inv = invoices[i];' +
                 '        html += "<tr>";' +
-                '        html += "<td class=\\"action-cell\\">";' +
+                '        html += "<td class=\\"invoice-checkbox\\" style=\\"display: none; text-align: center;\\">";' +
+                '        html += "<input type=\\"checkbox\\" id=\\"checkbox-" + inv.id + "\\" class=\\"invoice-checkbox-input\\" ";' +
+                '        html += "onchange=\\"toggleInvoiceSelection(\'" + inv.id + "\', \'" + inv.amount + "\')\\" ";' +
+                '        html += "style=\\"width: 18px; height: 18px; cursor: pointer;\\" />";' +
+                '        html += "</td>";' +
+                '        html += "<td class=\\"action-cell invoice-action-buttons\\">";' +
                 '        var hasDispute = inv.hasDisputeChargeback || false;' +
                 '        var hasFraud = inv.hasFraudChargeback || false;' +
                 '        var disabledClass = (hasDispute || hasFraud) ? " disabled" : "";' +
@@ -6473,7 +7088,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '        html += "</td>";' +
                 '        html += "<td><a href=\\"/app/accounting/transactions/custinvc.nl?id=" + inv.id + "\\" target=\\"_blank\\">" + escapeHtmlClient(inv.tranid) + "</a></td>";' +
                 '        html += "<td>" + escapeHtmlClient(inv.date) + "</td>";' +
-                // UPDATED: Amount cell with edit functionality
                 '        html += "<td id=\\"amount-cell-" + inv.id + "\\">";' +
                 '        html += "<div style=\\"font-weight: bold;\\">$" + parseFloat(inv.amount).toFixed(2) + "</div>";' +
                 '        html += "<a href=\\"javascript:void(0)\\" onclick=\\"editPartialAmount(\'" + inv.id + "\', \'" + inv.amount + "\')\\" ";' +
@@ -6485,6 +7099,14 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '        html += "</tr>";' +
                 '    }' +
                 '    html += "</tbody></table>";' +
+                '    html += "<div id=\\"multi-select-summary\\" style=\\"display: none; margin-top: 15px; padding: 15px; background-color: #f8f9fa; border: 2px solid #007bff; border-radius: 6px;\\">";' +
+                '    html += "<div id=\\"running-total\\" style=\\"font-size: 16px; margin-bottom: 15px;\\"><strong>Selected: 0 invoice(s) | Total: <span style=\\"color: #28a745;\\">$0.00</span></strong></div>";' +
+                '    html += "<div style=\\"display: flex; gap: 10px;\\">";' +
+                '    html += "<button type=\\"button\\" class=\\"action-btn chargeback-btn\\" style=\\"font-size: 14px; padding: 10px 20px;\\" onclick=\\"processMultipleInvoices(\'chargeback\')\\\">Process All as Dispute Chargeback</button>";' +
+                '    html += "<button type=\\"button\\" class=\\"action-btn fraud-btn\\" style=\\"font-size: 14px; padding: 10px 20px;\\" onclick=\\"processMultipleInvoices(\'fraud\')\\\">Process All as Fraud Chargeback</button>";' +
+                '    html += "<button type=\\"button\\" class=\\"action-btn nsf-btn\\" style=\\"font-size: 14px; padding: 10px 20px;\\" onclick=\\"processMultipleInvoices(\'nsf\')\\\">Process All as NSF Check</button>";' +
+                '    html += "</div>";' +
+                '    html += "</div>";' +
                 '    return html;' +
                 '}' +
                 // UPDATED: buildDepositsTable() - add edit amount functionality
