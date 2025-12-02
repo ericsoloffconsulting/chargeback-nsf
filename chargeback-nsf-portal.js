@@ -4546,14 +4546,20 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 var action = params.action;
                 var invoiceId = params.invoiceId;
                 var type = params.type;
+                var partialAmount = params.partialAmount; // NEW: Get partial amount if provided
 
                 if (!action || !invoiceId || !type) {
                     throw new Error('Missing required parameters');
                 }
 
-                log.debug('Processing Action', 'Action: ' + action + ' | Invoice: ' + invoiceId + ' | Type: ' + type);
+                log.debug('Processing Action', {
+                    action: action,
+                    invoice: invoiceId,
+                    type: type,
+                    partialAmount: partialAmount || 'Not specified (will use full amount)'
+                });
 
-                var result = processChargebackOrNsf(invoiceId, type);
+                var result = processChargebackOrNsf(invoiceId, type, partialAmount); // NEW: Pass partial amount
 
                 redirect.toSuitelet({
                     scriptId: runtime.getCurrentScript().id,
@@ -4990,17 +4996,20 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-  * Handles deposit refund processing - creates customer refund from deposit
-  * @param {Object} context
-  */
+   * Handles deposit refund processing - creates customer refund from deposit
+   * UPDATED: Extract partial amount from request parameters
+   * @param {Object} context
+   */
         function handleDepositRefund(context) {
             var request = context.request;
             var depositId = request.parameters.depositId;
             var type = request.parameters.type;
+            var partialAmount = request.parameters.partialAmount; // NEW: Get partial amount
 
             log.audit('Deposit Refund Request', {
                 depositId: depositId,
-                type: type
+                type: type,
+                partialAmount: partialAmount || 'Not specified (will use full unapplied amount)'
             });
 
             try {
@@ -5008,7 +5017,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     throw new Error('Deposit ID and type are required');
                 }
 
-                var result = processDepositRefund(depositId, type);
+                var result = processDepositRefund(depositId, type, partialAmount); // NEW: Pass partial amount
 
                 redirect.toSuitelet({
                     scriptId: runtime.getCurrentScript().id,
@@ -5018,9 +5027,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         type: type,
                         customer: encodeURIComponent(result.customerName),
                         refundId: result.refundId,
-                        refundTranId: result.refundTranId,  // NEW: Add tranid
+                        refundTranId: result.refundTranId,
                         depositId: depositId,
-                        depositTranId: result.depositTranId,  // NEW: Add tranid
+                        depositTranId: result.depositTranId,
                         amount: result.amount
                     }
                 });
@@ -5044,16 +5053,18 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
- * Processes deposit refund - creates customer refund applying to deposit
- * UPDATED: Update Sales Order with appropriate checkbox based on type
- * @param {string} depositId - Customer Deposit internal ID
- * @param {string} type - 'chargeback', 'fraud', or 'nsf'
- * @returns {Object} Result with refund details
- */
-        function processDepositRefund(depositId, type) {
+         * Processes deposit refund - creates customer refund applying to deposit
+         * UPDATED: Support partial amounts and update Sales Order with appropriate checkbox based on type
+         * @param {string} depositId - Customer Deposit internal ID
+         * @param {string} type - 'chargeback', 'fraud', or 'nsf'
+         * @param {string} partialAmount - Optional partial amount (if not provided, uses full unapplied amount)
+         * @returns {Object} Result with refund details
+         */
+        function processDepositRefund(depositId, type, partialAmount) {
             log.audit('Processing Deposit Refund', {
                 depositId: depositId,
-                type: type
+                type: type,
+                partialAmount: partialAmount || 'Not specified'
             });
 
             // Load the deposit
@@ -5066,16 +5077,42 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             var customerId = depositRecord.getValue('customer');
             var customerName = depositRecord.getText('customer');
             var tranId = depositRecord.getValue('tranid');
-            var amountToRefund = depositRecord.getValue('undepositedfunds') || depositRecord.getValue('payment');
+            var fullUnappliedAmount = depositRecord.getValue('undepositedfunds') || depositRecord.getValue('payment');
             var salesOrderId = depositRecord.getValue('salesorder');
+
+            // NEW: Determine amount to use (partial or full)
+            var amountToRefund;
+            if (partialAmount && partialAmount.trim() !== '') {
+                amountToRefund = parseFloat(partialAmount);
+
+                // Validate partial amount
+                if (isNaN(amountToRefund) || amountToRefund <= 0) {
+                    throw new Error('Invalid partial amount: ' + partialAmount);
+                }
+
+                if (amountToRefund > fullUnappliedAmount) {
+                    throw new Error('Partial amount ($' + amountToRefund.toFixed(2) + ') cannot exceed unapplied deposit amount ($' + fullUnappliedAmount.toFixed(2) + ')');
+                }
+
+                log.audit('Using Partial Amount', {
+                    partialAmount: amountToRefund,
+                    fullUnappliedAmount: fullUnappliedAmount,
+                    percentOfTotal: ((amountToRefund / fullUnappliedAmount) * 100).toFixed(2) + '%'
+                });
+            } else {
+                amountToRefund = fullUnappliedAmount;
+                log.debug('Using Full Unapplied Amount', amountToRefund);
+            }
 
             log.debug('Deposit Loaded', {
                 depositId: depositId,
                 tranId: tranId,
                 customerId: customerId,
                 customerName: customerName,
+                fullUnappliedAmount: fullUnappliedAmount,
                 amountToRefund: amountToRefund,
-                salesOrderId: salesOrderId
+                salesOrderId: salesOrderId,
+                isPartial: amountToRefund < fullUnappliedAmount
             });
 
             // Create customer refund
@@ -5089,6 +5126,11 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
             var memoText = type === 'nsf' ? 'NSF Check Deposit Refund' :
                 (type === 'fraud' ? 'Fraud Chargeback Deposit Refund' : 'Dispute Chargeback Deposit Refund');
+
+            // NEW: Add partial amount indicator to memo if applicable
+            if (amountToRefund < fullUnappliedAmount) {
+                memoText += ' - PARTIAL AMOUNT: $' + amountToRefund.toFixed(2) + ' of $' + fullUnappliedAmount.toFixed(2);
+            }
 
             customerRefund.setValue('memo', memoText);
 
@@ -5112,13 +5154,15 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 log.audit('No Sales Order on Deposit', 'Deposit ID: ' + depositId + ' has no linked Sales Order - custbody_bas_refunded_transaction not set');
             }
 
+            // NEW: Set refund total to partial or full amount
             customerRefund.setValue('total', amountToRefund);
 
             log.debug('Customer Refund Header Set', {
                 customer: customerId,
                 amount: amountToRefund,
                 tranId: customTranId,
-                refundedTransaction: salesOrderId || 'None'
+                refundedTransaction: salesOrderId || 'None',
+                isPartial: amountToRefund < fullUnappliedAmount
             });
 
             // Find and apply the deposit
@@ -5142,6 +5186,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         fieldId: 'apply',
                         value: true
                     });
+                    // NEW: Apply partial or full amount
                     customerRefund.setCurrentSublistValue({
                         sublistId: 'deposit',
                         fieldId: 'amount',
@@ -5151,7 +5196,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     depositApplied = true;
                     log.debug('Applied to Deposit', {
                         line: i,
-                        amount: amountToRefund
+                        amount: amountToRefund,
+                        isPartial: amountToRefund < fullUnappliedAmount
                     });
                     break;
                 }
@@ -5168,11 +5214,13 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 refundTranId: customTranId,
                 depositId: depositId,
                 depositTranId: tranId,
-                amount: amountToRefund,
+                fullUnappliedAmount: fullUnappliedAmount,
+                amountRefunded: amountToRefund,
+                isPartial: amountToRefund < fullUnappliedAmount,
                 linkedSalesOrder: salesOrderId || 'None'
             });
 
-            // NEW: Update Sales Order with appropriate checkbox if Sales Order exists
+            // Update Sales Order with appropriate checkbox if Sales Order exists
             if (salesOrderId) {
                 try {
                     // Determine which checkbox to update based on type
@@ -5200,7 +5248,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         checkboxField: checkboxField,
                         checkboxValue: true,
                         depositId: depositId,
-                        refundType: type
+                        refundType: type,
+                        refundAmount: amountToRefund,
+                        wasPartial: amountToRefund < fullUnappliedAmount
                     });
 
                 } catch (soUpdateError) {
@@ -5225,29 +5275,34 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-   * Processes chargeback or NSF check for an invoice
-   * UPDATED: Get tranids for success message, update correct checkboxes on original invoice
-   * @param {string} invoiceId - Internal ID of the original invoice
-   * @param {string} type - 'chargeback', 'fraud', or 'nsf'
-   * @returns {Object} Object containing created record IDs and customer name
-   */
-        function processChargebackOrNsf(invoiceId, type) {
-            log.audit('Process Start', 'Invoice ID: ' + invoiceId + ' | Type: ' + type);
+    * Processes chargeback or NSF check for an invoice
+    * UPDATED: Support partial amounts
+    * @param {string} invoiceId - Internal ID of the original invoice
+    * @param {string} type - 'chargeback', 'fraud', or 'nsf'
+    * @param {string} partialAmount - Optional partial amount (if not provided, uses full invoice amount)
+    * @returns {Object} Object containing created record IDs and customer name
+    */
+        function processChargebackOrNsf(invoiceId, type, partialAmount) {
+            log.audit('Process Start', {
+                invoiceId: invoiceId,
+                type: type,
+                partialAmount: partialAmount || 'Not specified'
+            });
 
             var itemId;
             var memoText;
             var checkboxField;
 
             if (type === 'nsf') {
-                itemId = '304417'; // NSF Check item
+                itemId = '304417';
                 memoText = 'NSF Check';
                 checkboxField = 'custbody_bas_nsf_check';
             } else if (type === 'fraud') {
-                itemId = '304429'; // Fraud item
+                itemId = '304429';
                 memoText = 'Fraud Chargeback';
                 checkboxField = 'custbody_bas_fraud';
-            } else { // chargeback (dispute)
-                itemId = '304416'; // Credit Card Dispute Chargeback item
+            } else {
+                itemId = '304416';
                 memoText = 'Credit Card Chargeback';
                 checkboxField = 'custbody_bas_cc_dispute';
             }
@@ -5259,13 +5314,43 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
             var customerId = originalInvoice.getValue('entity');
             var customerName = originalInvoice.getText('entity');
-            var originalAmount = originalInvoice.getValue('total');
+            var fullInvoiceAmount = originalInvoice.getValue('total');
             var department = originalInvoice.getValue('department');
             var subsidiary = originalInvoice.getValue('subsidiary');
             var classField = originalInvoice.getValue('class');
             var originalTranId = originalInvoice.getValue('tranid');
 
-            log.debug('Original Invoice Loaded', 'Customer: ' + customerName + ' | Amount: ' + originalAmount + ' | Department: ' + department + ' | Class: ' + classField);
+            // NEW: Determine amount to use (partial or full)
+            var amountToProcess;
+            if (partialAmount && partialAmount.trim() !== '') {
+                amountToProcess = parseFloat(partialAmount);
+
+                // Validate partial amount
+                if (isNaN(amountToProcess) || amountToProcess <= 0) {
+                    throw new Error('Invalid partial amount: ' + partialAmount);
+                }
+
+                if (amountToProcess > fullInvoiceAmount) {
+                    throw new Error('Partial amount ($' + amountToProcess.toFixed(2) + ') cannot exceed invoice amount ($' + fullInvoiceAmount.toFixed(2) + ')');
+                }
+
+                log.audit('Using Partial Amount', {
+                    partialAmount: amountToProcess,
+                    fullAmount: fullInvoiceAmount,
+                    percentOfTotal: ((amountToProcess / fullInvoiceAmount) * 100).toFixed(2) + '%'
+                });
+            } else {
+                amountToProcess = fullInvoiceAmount;
+                log.debug('Using Full Invoice Amount', amountToProcess);
+            }
+
+            log.debug('Original Invoice Loaded', {
+                customer: customerName,
+                fullAmount: fullInvoiceAmount,
+                amountToProcess: amountToProcess,
+                department: department,
+                class: classField
+            });
 
             // Lookup fulfilling location from department record
             var location = null;
@@ -5284,24 +5369,17 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
             log.debug('Credit Memo Transformed', 'From Invoice: ' + invoiceId);
 
-            // Prevent auto-emailing
             creditMemo.setValue('tobeemailed', false);
-            log.debug('Set Credit Memo To Be Emailed', 'Value: false');
 
-            // Set location at header level (REQUIRED for Credit Memo)
             if (location) {
                 creditMemo.setValue('location', location);
-                log.debug('Set Credit Memo Header Location', 'Location: ' + location);
             }
 
-            // Set department at header level
             if (department) {
                 creditMemo.setValue('department', department);
-                log.debug('Set Credit Memo Header Department', 'Department: ' + department);
             }
 
             var lineCount = creditMemo.getLineCount({ sublistId: 'item' });
-            log.debug('Credit Memo Line Count', 'Lines to remove: ' + lineCount);
 
             for (var i = lineCount - 1; i >= 0; i--) {
                 creditMemo.removeLine({
@@ -5316,56 +5394,59 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 fieldId: 'item',
                 value: itemId
             });
+            // NEW: Use amountToProcess instead of originalAmount
             creditMemo.setCurrentSublistValue({
                 sublistId: 'item',
                 fieldId: 'amount',
-                value: originalAmount
+                value: amountToProcess
             });
 
-            // Set location on line if available
             if (location) {
                 creditMemo.setCurrentSublistValue({
                     sublistId: 'item',
                     fieldId: 'location',
                     value: location
                 });
-                log.debug('Set Credit Memo Line Location', 'Location: ' + location);
             }
 
-            // Set department on line if available
             if (department) {
                 creditMemo.setCurrentSublistValue({
                     sublistId: 'item',
                     fieldId: 'department',
                     value: department
                 });
-                log.debug('Set Credit Memo Line Department', 'Department: ' + department);
             }
 
-            // Set class on line if available
             if (classField) {
                 creditMemo.setCurrentSublistValue({
                     sublistId: 'item',
                     fieldId: 'class',
                     value: classField
                 });
-                log.debug('Set Credit Memo Line Class', 'Class: ' + classField);
             }
 
             creditMemo.commitLine({ sublistId: 'item' });
-            creditMemo.setValue('memo', memoText);
+
+            // NEW: Update memo to indicate if partial amount
+            var creditMemoMemo = memoText;
+            if (amountToProcess < fullInvoiceAmount) {
+                creditMemoMemo += ' - PARTIAL AMOUNT: $' + amountToProcess.toFixed(2) + ' of $' + fullInvoiceAmount.toFixed(2);
+            }
+            creditMemo.setValue('memo', creditMemoMemo);
 
             var creditMemoId = creditMemo.save();
-            log.audit('Credit Memo Created', 'ID: ' + creditMemoId + ' | Amount: ' + originalAmount);
+            log.audit('Credit Memo Created', {
+                id: creditMemoId,
+                amount: amountToProcess,
+                isPartial: amountToProcess < fullInvoiceAmount
+            });
 
-            // UPDATED: Get the credit memo tranid immediately after saving
             var creditMemoRecord = record.load({
                 type: record.Type.CREDIT_MEMO,
                 id: creditMemoId,
                 isDynamic: false
             });
             var creditMemoTranId = creditMemoRecord.getValue('tranid');
-            log.debug('Credit Memo TranId', 'TranId: ' + creditMemoTranId);
 
             // Step 2: Create Customer Refund
             var customerRefund = record.create({
@@ -5375,38 +5456,32 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
             customerRefund.setValue('customer', customerId);
             customerRefund.setValue('paymentmethod', '15');
-            customerRefund.setValue('memo', memoText);
 
-            // Set custom transaction number based on type and original invoice number
+            // NEW: Update memo to indicate if partial amount
+            var refundMemo = memoText;
+            if (amountToProcess < fullInvoiceAmount) {
+                refundMemo += ' - PARTIAL AMOUNT';
+            }
+            customerRefund.setValue('memo', refundMemo);
+
             var refundPrefix = type === 'nsf' ? 'NSF_CHECK' : (type === 'fraud' ? 'FRAUD_CC' : 'CHARGEBACK_CC');
             var customTranId = refundPrefix + '_' + originalTranId;
 
             customerRefund.setValue('tranid', customTranId);
-            log.debug('Set Customer Refund TranId', 'Custom ID: ' + customTranId);
 
-            // Set the refunded transaction
             try {
                 customerRefund.setValue({
                     fieldId: 'custbody_bas_refunded_transaction',
                     value: creditMemoId
                 });
-                log.debug('Set Refunded Transaction Field', 'Credit Memo ID: ' + creditMemoId);
             } catch (e) {
-                log.error('Error Setting Refunded Transaction', 'Field may have different ID. Error: ' + e.message);
-                try {
-                    customerRefund.setValue('createdfrom', creditMemoId);
-                    log.debug('Set Created From Field', 'Credit Memo ID: ' + creditMemoId);
-                } catch (e2) {
-                    log.error('Error Setting Created From', e2.message);
-                }
+                log.error('Error Setting Refunded Transaction', 'Error: ' + e.message);
             }
 
-            customerRefund.setValue('total', originalAmount);
-
-            log.debug('Customer Refund Header Values Set', 'Customer: ' + customerId + ' | Amount: ' + originalAmount + ' | TranId: ' + customTranId);
+            // NEW: Use amountToProcess
+            customerRefund.setValue('total', amountToProcess);
 
             var applyLineCount = customerRefund.getLineCount({ sublistId: 'apply' });
-            log.debug('Apply Lines Available', 'Count: ' + applyLineCount);
 
             for (var j = 0; j < applyLineCount; j++) {
                 var applyInternalId = customerRefund.getSublistValue({
@@ -5414,8 +5489,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     fieldId: 'internalid',
                     line: j
                 });
-
-                log.debug('Apply Line ' + j, 'Internal ID: ' + applyInternalId);
 
                 if (applyInternalId == creditMemoId) {
                     customerRefund.selectLine({
@@ -5427,21 +5500,25 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         fieldId: 'apply',
                         value: true
                     });
+                    // NEW: Use amountToProcess
                     customerRefund.setCurrentSublistValue({
                         sublistId: 'apply',
                         fieldId: 'amount',
-                        value: originalAmount
+                        value: amountToProcess
                     });
                     customerRefund.commitLine({ sublistId: 'apply' });
-                    log.debug('Applied to Credit Memo', 'Line: ' + j + ' | Amount: ' + originalAmount);
+                    log.debug('Applied to Credit Memo', 'Line: ' + j + ' | Amount: ' + amountToProcess);
                     break;
                 }
             }
 
             var refundId = customerRefund.save();
-            log.audit('Customer Refund Created', 'ID: ' + refundId + ' | Amount: ' + originalAmount);
+            log.audit('Customer Refund Created', {
+                id: refundId,
+                amount: amountToProcess,
+                isPartial: amountToProcess < fullInvoiceAmount
+            });
 
-            // UPDATED: The refund tranid is the custom one we set
             var refundTranId = customTranId;
 
             // Step 3: Create new invoice
@@ -5451,32 +5528,19 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 isDynamic: true
             });
 
-            log.debug('New Invoice Copied', 'From Invoice: ' + invoiceId);
-
             newInvoice.setValue('trandate', new Date());
-
-            // Prevent auto-emailing
             newInvoice.setValue('tobeemailed', false);
-            log.debug('Set New Invoice To Be Emailed', 'Value: false');
-
-            // Set Generate Payment Link checkbox to true
             newInvoice.setValue('custbody_b4cp_gen_pay_online_link', true);
-            log.debug('Set Generate Payment Link', 'Value: true');
 
-            // Set location at header level if available
             if (location) {
                 newInvoice.setValue('location', location);
-                log.debug('Set New Invoice Header Location', 'Location: ' + location);
             }
 
-            // Set department at header level if available
             if (department) {
                 newInvoice.setValue('department', department);
-                log.debug('Set New Invoice Header Department', 'Department: ' + department);
             }
 
             var newInvLineCount = newInvoice.getLineCount({ sublistId: 'item' });
-            log.debug('New Invoice Line Count', 'Lines to remove: ' + newInvLineCount);
 
             for (var k = newInvLineCount - 1; k >= 0; k--) {
                 newInvoice.removeLine({
@@ -5491,63 +5555,64 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 fieldId: 'item',
                 value: itemId
             });
+            // NEW: Use amountToProcess
             newInvoice.setCurrentSublistValue({
                 sublistId: 'item',
                 fieldId: 'amount',
-                value: originalAmount
+                value: amountToProcess
             });
 
-            // Set location on new invoice line
             if (location) {
                 newInvoice.setCurrentSublistValue({
                     sublistId: 'item',
                     fieldId: 'location',
                     value: location
                 });
-                log.debug('Set New Invoice Line Location', 'Location: ' + location);
             }
 
-            // Set department if available
             if (department) {
                 newInvoice.setCurrentSublistValue({
                     sublistId: 'item',
                     fieldId: 'department',
                     value: department
                 });
-                log.debug('Set New Invoice Line Department', 'Department: ' + department);
             }
 
-            // Set class if available
             if (classField) {
                 newInvoice.setCurrentSublistValue({
                     sublistId: 'item',
                     fieldId: 'class',
                     value: classField
                 });
-                log.debug('Set New Invoice Line Class', 'Class: ' + classField);
             }
 
             newInvoice.commitLine({ sublistId: 'item' });
 
-            newInvoice.setValue('memo', memoText + ' - Original Invoice: ' + originalTranId);
+            // NEW: Update memo to show partial amount info
+            var newInvoiceMemo = memoText + ' - Original Invoice: ' + originalTranId;
+            if (amountToProcess < fullInvoiceAmount) {
+                newInvoiceMemo += ' - PARTIAL AMOUNT: $' + amountToProcess.toFixed(2) + ' of $' + fullInvoiceAmount.toFixed(2);
+            }
+            newInvoice.setValue('memo', newInvoiceMemo);
 
             var newInvoiceId = newInvoice.save();
-            log.audit('New Invoice Created', 'ID: ' + newInvoiceId + ' | Amount: ' + originalAmount);
+            log.audit('New Invoice Created', {
+                id: newInvoiceId,
+                amount: amountToProcess,
+                isPartial: amountToProcess < fullInvoiceAmount
+            });
 
-            // UPDATED: Get the new invoice tranid immediately after saving
             var newInvoiceRecord = record.load({
                 type: record.Type.INVOICE,
                 id: newInvoiceId,
                 isDynamic: false
             });
             var newInvoiceTranId = newInvoiceRecord.getValue('tranid');
-            log.debug('New Invoice TranId', 'TranId: ' + newInvoiceTranId);
 
-            // UPDATED: Step 4: Update ORIGINAL invoice with memo and appropriate checkbox (not new invoice)
+            // Step 4: Update ORIGINAL invoice
             try {
                 var memoPrefix = type === 'nsf' ? 'NSF CHECK, SEE' : (type === 'fraud' ? 'FRAUD CHARGEBACK, SEE' : 'CHARGEBACK, SEE');
 
-                // Load the original invoice to get existing memo
                 var originalInvoiceForUpdate = record.load({
                     type: record.Type.INVOICE,
                     id: invoiceId,
@@ -5556,13 +5621,14 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
                 var existingMemo = originalInvoiceForUpdate.getValue('memo') || '';
 
-                // Build the new memo text
+                // NEW: Include partial amount info in memo
                 var newMemoText = memoPrefix + ' ' + newInvoiceTranId + ' AND ' + creditMemoTranId;
+                if (amountToProcess < fullInvoiceAmount) {
+                    newMemoText += ' (PARTIAL $' + amountToProcess.toFixed(2) + ')';
+                }
 
-                // Append to existing memo with hyphen separator if memo exists
                 var updateMemo = existingMemo ? existingMemo + ' - ' + newMemoText : newMemoText;
 
-                // UPDATED: Set the appropriate checkbox based on type on the ORIGINAL invoice
                 var updateValues = {
                     memo: updateMemo
                 };
@@ -5576,10 +5642,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
                 log.audit('Original Invoice Updated', {
                     invoiceId: invoiceId,
-                    existingMemo: existingMemo,
                     newMemo: updateMemo,
                     checkboxField: checkboxField,
-                    checkboxValue: true
+                    isPartial: amountToProcess < fullInvoiceAmount
                 });
 
             } catch (updateError) {
@@ -5588,11 +5653,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     stack: updateError.stack,
                     invoiceId: invoiceId
                 });
-                // Don't throw error - the main process completed successfully
             }
 
-            // UPDATED: Return tranids instead of just IDs
-            var resultData = {
+            return {
                 creditMemoId: creditMemoId,
                 creditMemoTranId: creditMemoTranId,
                 refundId: refundId,
@@ -5601,12 +5664,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 newInvoiceTranId: newInvoiceTranId,
                 customerName: customerName
             };
-
-            // NOTE: Fraud chargebacks no longer automatically create JE write-offs
-            // Users must manually create JE write-offs for fraud chargebacks using the "JE Write Off" button
-            // This matches the process for dispute chargebacks
-
-            return resultData;
         }
 
         /**
@@ -5740,6 +5797,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 'var currentUploadTranId = null;' +
                 // PHASE 3: File queue storage - one queue per invoice
                 'var fileQueues = {};' +
+                // NEW: Partial amount storage - keyed by invoice ID
+                'var partialAmounts = {};' +
                 'function refreshPage() { window.location.reload(); }' +
                 'function showLoading(message) {' +
                 '    var overlay = document.getElementById("loadingOverlay");' +
@@ -6414,13 +6473,21 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '        html += "</td>";' +
                 '        html += "<td><a href=\\"/app/accounting/transactions/custinvc.nl?id=" + inv.id + "\\" target=\\"_blank\\">" + escapeHtmlClient(inv.tranid) + "</a></td>";' +
                 '        html += "<td>" + escapeHtmlClient(inv.date) + "</td>";' +
-                '        html += "<td style=\\"font-weight: bold;\\">$" + parseFloat(inv.amount).toFixed(2) + "</td>";' +
+                // UPDATED: Amount cell with edit functionality
+                '        html += "<td id=\\"amount-cell-" + inv.id + "\\">";' +
+                '        html += "<div style=\\"font-weight: bold;\\">$" + parseFloat(inv.amount).toFixed(2) + "</div>";' +
+                '        html += "<a href=\\"javascript:void(0)\\" onclick=\\"editPartialAmount(\'" + inv.id + "\', \'" + inv.amount + "\')\\" ";' +
+                '        html += "style=\\"font-size: 11px; color: #007bff; text-decoration: none; margin-top: 4px; display: inline-block;\\" ";' +
+                '        html += "title=\\"Edit\\">";' +
+                '        html += "✏️ Edit</a>";' +
+                '        html += "</td>";' +
                 '        html += "<td>" + escapeHtmlClient(inv.memo) + "</td>";' +
                 '        html += "</tr>";' +
                 '    }' +
                 '    html += "</tbody></table>";' +
                 '    return html;' +
                 '}' +
+                // UPDATED: buildDepositsTable() - add edit amount functionality
                 'function buildDepositsTable(deposits) {' +
                 '    var html = "<table class=\\"search-table\\">";' +
                 '    html += "<thead><tr><th>Action</th><th>Deposit #</th><th>Date</th><th>Unapplied Amount</th><th>Sales Order</th><th>Memo</th></tr></thead><tbody>";' +
@@ -6434,7 +6501,14 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '        html += "</td>";' +
                 '        html += "<td><a href=\\"/app/accounting/transactions/custdep.nl?id=" + dep.id + "\\" target=\\"_blank\\">" + escapeHtmlClient(dep.tranid) + "</a></td>";' +
                 '        html += "<td>" + escapeHtmlClient(dep.date) + "</td>";' +
-                '        html += "<td style=\\"font-weight: bold;\\">$" + parseFloat(dep.amountRemaining).toFixed(2) + "</td>";' +
+                // NEW: Amount cell with edit functionality (same pattern as invoices)
+                '        html += "<td id=\\"deposit-amount-cell-" + dep.id + "\\">";' +
+                '        html += "<div style=\\"font-weight: bold;\\">$" + parseFloat(dep.amountRemaining).toFixed(2) + "</div>";' +
+                '        html += "<a href=\\"javascript:void(0)\\" onclick=\\"editDepositPartialAmount(\'" + dep.id + "\', \'" + dep.amountRemaining + "\')\\" ";' +
+                '        html += "style=\\"font-size: 11px; color: #007bff; text-decoration: none; margin-top: 4px; display: inline-block;\\" ";' +
+                '        html += "title=\\"Edit\\">";' +
+                '        html += "✏️ Edit</a>";' +
+                '        html += "</td>";' +
                 '        html += "<td>";' +
                 '        if (dep.salesOrder && dep.salesOrderId) {' +
                 '            html += "<a href=\\"/app/accounting/transactions/salesord.nl?id=" + dep.salesOrderId + "\\" target=\\"_blank\\">" + escapeHtmlClient(dep.salesOrder) + "</a>";' +
@@ -6447,6 +6521,48 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    }' +
                 '    html += "</tbody></table>";' +
                 '    return html;' +
+                '}' +
+                // NEW: Edit partial amount for deposits
+                'function editDepositPartialAmount(depositId, originalAmount) {' +
+                '    var currentAmount = partialAmounts[depositId] || originalAmount;' +
+                '    var promptMsg = "Enter partial amount for this deposit refund:\\n\\n";' +
+                '    promptMsg += "Unapplied Deposit Amount: $" + parseFloat(originalAmount).toFixed(2) + "\\n";' +
+                '    promptMsg += "\\nEnter refund amount (cannot exceed unapplied amount):";' +
+                '    var userInput = prompt(promptMsg, currentAmount);' +
+                '    if (userInput === null) return;' +
+                '    var newAmount = parseFloat(userInput);' +
+                '    if (isNaN(newAmount)) {' +
+                '        alert("Invalid amount. Please enter a valid number.");' +
+                '        return;' +
+                '    }' +
+                '    if (newAmount <= 0) {' +
+                '        alert("Amount must be greater than zero.");' +
+                '        return;' +
+                '    }' +
+                '    if (newAmount > parseFloat(originalAmount)) {' +
+                '        alert("Amount cannot exceed the unapplied deposit amount of $" + parseFloat(originalAmount).toFixed(2));' +
+                '        return;' +
+                '    }' +
+                '    partialAmounts[depositId] = newAmount.toFixed(2);' +
+                '    updateDepositAmountDisplay(depositId, originalAmount);' +
+                '}' +
+                // NEW: Update deposit amount display
+                'function updateDepositAmountDisplay(depositId, originalAmount) {' +
+                '    var amountCell = document.getElementById("deposit-amount-cell-" + depositId);' +
+                '    if (!amountCell) return;' +
+                '    var partialAmount = partialAmounts[depositId];' +
+                '    var html = "";' +
+                '    if (partialAmount && parseFloat(partialAmount) !== parseFloat(originalAmount)) {' +
+                '        html += "<div style=\\"font-weight: bold; color: #28a745;\\">$" + parseFloat(partialAmount).toFixed(2) + "</div>";' +
+                '        html += "<div style=\\"font-size: 10px; color: #666; text-decoration: line-through;\\">was $" + parseFloat(originalAmount).toFixed(2) + "</div>";' +
+                '    } else {' +
+                '        html += "<div style=\\"font-weight: bold;\\">$" + parseFloat(originalAmount).toFixed(2) + "</div>";' +
+                '    }' +
+                '    html += "<a href=\\"javascript:void(0)\\" onclick=\\"editDepositPartialAmount(\'" + depositId + "\', \'" + originalAmount + "\')\\" ";' +
+                '    html += "style=\\"font-size: 11px; color: #007bff; text-decoration: none; margin-top: 4px; display: inline-block;\\" ";' +
+                '    html += "title=\\"Edit\\">";' +
+                '    html += "✏️ Edit</a>";' +
+                '    amountCell.innerHTML = html;' +
                 '}' +
                 'function buildRefundsTable(refunds) {' +
                 '    var html = "<table class=\\"search-table\\">";' +
@@ -6468,9 +6584,15 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    html += "</tbody></table>";' +
                 '    return html;' +
                 '}' +
+                // UPDATED: Submit deposit refund with partial amount
                 'function submitDepositRefund(depositId, type) {' +
+                '    var partialAmount = partialAmounts[depositId];' +
                 '    var typeText = type === "nsf" ? "NSF Check" : (type === "fraud" ? "Fraud Chargeback" : "Dispute Chargeback");' +
-                '    if (!confirm("Process " + typeText + " for this deposit?\\n\\nThis will create a customer refund from the unapplied deposit amount.")) {' +
+                '    var confirmMsg = "Process " + typeText + " for this deposit?\\n\\nThis will create a customer refund from the unapplied deposit amount.";' +
+                '    if (partialAmount) {' +
+                '        confirmMsg += "\\n\\nPartial Amount: $" + parseFloat(partialAmount).toFixed(2);' +
+                '    }' +
+                '    if (!confirm(confirmMsg)) {' +
                 '        return;' +
                 '    }' +
                 '    showLoading("Processing deposit refund...");' +
@@ -6492,6 +6614,14 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    typeInput.name = "type";' +
                 '    typeInput.value = type;' +
                 '    form.appendChild(typeInput);' +
+                // NEW: Add partial amount if set
+                '    if (partialAmount) {' +
+                '        var amountInput = document.createElement("input");' +
+                '        amountInput.type = "hidden";' +
+                '        amountInput.name = "partialAmount";' +
+                '        amountInput.value = partialAmount;' +
+                '        form.appendChild(amountInput);' +
+                '    }' +
                 '    document.body.appendChild(form);' +
                 '    form.submit();' +
                 '}' +
@@ -6530,9 +6660,57 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    document.body.appendChild(form);' +
                 '    form.submit();' +
                 '}' +
+                // NEW: Edit partial amount function
+                'function editPartialAmount(invoiceId, originalAmount) {' +
+                '    var currentAmount = partialAmounts[invoiceId] || originalAmount;' +
+                '    var promptMsg = "Enter partial amount for this invoice:\\n\\n";' +
+                '    promptMsg += "Original Invoice Amount: $" + parseFloat(originalAmount).toFixed(2) + "\\n";' +
+                '    promptMsg += "\\nEnter amount (cannot exceed original):";' +
+                '    var userInput = prompt(promptMsg, currentAmount);' +
+                '    if (userInput === null) return;' +
+                '    var newAmount = parseFloat(userInput);' +
+                '    if (isNaN(newAmount)) {' +
+                '        alert("Invalid amount. Please enter a valid number.");' +
+                '        return;' +
+                '    }' +
+                '    if (newAmount <= 0) {' +
+                '        alert("Amount must be greater than zero.");' +
+                '        return;' +
+                '    }' +
+                '    if (newAmount > parseFloat(originalAmount)) {' +
+                '        alert("Amount cannot exceed the original invoice amount of $" + parseFloat(originalAmount).toFixed(2));' +
+                '        return;' +
+                '    }' +
+                '    partialAmounts[invoiceId] = newAmount.toFixed(2);' +
+                '    updateAmountDisplay(invoiceId, originalAmount);' +
+                '}' +
+                // NEW: Update amount display
+                'function updateAmountDisplay(invoiceId, originalAmount) {' +
+                '    var amountCell = document.getElementById("amount-cell-" + invoiceId);' +
+                '    if (!amountCell) return;' +
+                '    var partialAmount = partialAmounts[invoiceId];' +
+                '    var html = "";' +
+                '    if (partialAmount && parseFloat(partialAmount) !== parseFloat(originalAmount)) {' +
+                '        html += "<div style=\\"font-weight: bold; color: #28a745;\\">$" + parseFloat(partialAmount).toFixed(2) + "</div>";' +
+                '        html += "<div style=\\"font-size: 10px; color: #666; text-decoration: line-through;\\">was $" + parseFloat(originalAmount).toFixed(2) + "</div>";' +
+                '    } else {' +
+                '        html += "<div style=\\"font-weight: bold;\\">$" + parseFloat(originalAmount).toFixed(2) + "</div>";' +
+                '    }' +
+                '    html += "<a href=\\"javascript:void(0)\\" onclick=\\"editPartialAmount(\'" + invoiceId + "\', \'" + originalAmount + "\')\\" ";' +
+                '    html += "style=\\"font-size: 11px; color: #007bff; text-decoration: none; margin-top: 4px; display: inline-block;\\" ";' +
+                '    html += "title=\\"Edit\\">";' +
+                '    html += "✏️ Edit</a>";' +
+                '    amountCell.innerHTML = html;' +
+                '}' +
+                // UPDATED: Process action to include partial amount
                 'function processAction(dataId, invoiceId, type) {' +
+                '    var partialAmount = partialAmounts[invoiceId];' +
                 '    var typeText = type === "nsf" ? "NSF Check" : (type === "fraud" ? "Fraud Chargeback" : "Dispute Chargeback");' +
-                '    if (!confirm("Are you sure you want to process this " + typeText + "?")) {' +
+                '    var confirmMsg = "Are you sure you want to process this " + typeText + "?";' +
+                '    if (partialAmount) {' +
+                '        confirmMsg += "\\n\\nPartial Amount: $" + parseFloat(partialAmount).toFixed(2);' +
+                '    }' +
+                '    if (!confirm(confirmMsg)) {' +
                 '        return;' +
                 '    }' +
                 '    showLoading("Processing " + typeText + "...");' +
@@ -6554,9 +6732,17 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    typeInput.name = "type";' +
                 '    typeInput.value = type;' +
                 '    form.appendChild(typeInput);' +
+                // NEW: Add partial amount if set
+                '    if (partialAmount) {' +
+                '        var amountInput = document.createElement("input");' +
+                '        amountInput.type = "hidden";' +
+                '        amountInput.name = "partialAmount";' +
+                '        amountInput.value = partialAmount;' +
+                '        form.appendChild(amountInput);' +
+                '    }' +
                 '    document.body.appendChild(form);' +
                 '    form.submit();' +
-                '}';
+                '}'
         }
 
         /**
