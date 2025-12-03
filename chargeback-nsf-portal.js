@@ -1025,16 +1025,16 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
         /**
   * Searches for paid invoices for a specific customer
-  * UPDATED to include chargeback checkbox values with enhanced logging
+  * UPDATED to include payment application details (payments, DEPAs, customer deposits)
   * @param {string} customerId - Customer internal ID
-  * @returns {Array} Array of invoice objects
+  * @returns {Array} Array of invoice objects with payment application details
   */
         function searchPaidInvoices(customerId) {
             if (!customerId) {
                 return [];
             }
 
-            log.debug('Searching Paid Invoices', 'Customer ID: ' + customerId);
+            log.debug('Searching Paid Invoices with Payment Applications', 'Customer ID: ' + customerId);
 
             var invoiceSearch = search.create({
                 type: search.Type.INVOICE,
@@ -1048,47 +1048,152 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     ['mainline', 'is', 'T']
                 ],
                 columns: [
+                    // Invoice columns
                     search.createColumn({ name: 'tranid', sort: search.Sort.DESC }),
                     search.createColumn({ name: 'trandate' }),
                     search.createColumn({ name: 'amount' }),
                     search.createColumn({ name: 'memo' }),
-                    search.createColumn({ name: 'custbody_bas_cc_dispute' }), // Credit card dispute checkbox
-                    search.createColumn({ name: 'custbody_bas_fraud' }) // Fraud checkbox
+                    search.createColumn({ name: 'custbody_bas_cc_dispute' }),
+                    search.createColumn({ name: 'custbody_bas_fraud' }),
+                    
+                    // Applying transaction details (Payments, DEPAs, Credits, etc.)
+                    search.createColumn({ name: 'internalid', join: 'applyingTransaction' }),
+                    search.createColumn({ name: 'type', join: 'applyingTransaction' }),
+                    search.createColumn({ name: 'trandate', join: 'applyingTransaction' }),
+                    search.createColumn({ name: 'total', join: 'applyingTransaction' }),
+                    search.createColumn({ name: 'memo', join: 'applyingTransaction' }),
+                    
+                    // Created from field for DEPA transactions
+                    search.createColumn({ name: 'createdfrom', join: 'applyingTransaction' })
                 ]
             });
 
-            var results = [];
+            var invoiceMap = {};
+
             invoiceSearch.run().each(function (result) {
+                var invoiceId = result.id;
+                var tranid = result.getValue('tranid');
+                var trandate = result.getValue('trandate');
+                var amount = result.getValue('amount');
+                var memo = result.getValue('memo') || '';
                 var disputeValue = result.getValue('custbody_bas_cc_dispute');
                 var fraudValue = result.getValue('custbody_bas_fraud');
 
-                log.debug('Invoice Checkbox Values', {
-                    tranid: result.getValue('tranid'),
-                    disputeRaw: disputeValue,
-                    fraudRaw: fraudValue,
-                    disputeType: typeof disputeValue,
-                    fraudType: typeof fraudValue
-                });
+                // Initialize invoice object if not exists
+                if (!invoiceMap[invoiceId]) {
+                    invoiceMap[invoiceId] = {
+                        id: invoiceId,
+                        tranid: tranid,
+                        date: trandate,
+                        amount: amount,
+                        memo: memo,
+                        hasDisputeChargeback: disputeValue === 'T' || disputeValue === true,
+                        hasFraudChargeback: fraudValue === 'T' || fraudValue === true,
+                        paymentApplications: []
+                    };
+                }
 
-                results.push({
-                    id: result.id,
-                    tranid: result.getValue('tranid'),
-                    date: result.getValue('trandate'),
-                    amount: result.getValue('amount'),
-                    memo: result.getValue('memo') || '',
-                    hasDisputeChargeback: disputeValue === 'T' || disputeValue === true,
-                    hasFraudChargeback: fraudValue === 'T' || fraudValue === true
-                });
+                // Get applying transaction details
+                var applyingId = result.getValue({ name: 'internalid', join: 'applyingTransaction' });
+                var applyingType = result.getValue({ name: 'type', join: 'applyingTransaction' });
+                var applyingDate = result.getValue({ name: 'trandate', join: 'applyingTransaction' });
+                var applyingTotal = result.getValue({ name: 'total', join: 'applyingTransaction' });
+                var applyingMemo = result.getValue({ name: 'memo', join: 'applyingTransaction' }) || '';
+                var depositId = result.getValue({ name: 'createdfrom', join: 'applyingTransaction' });
 
-                return results.length < 1000; // Limit results
+                // Add applying transaction if it exists
+                if (applyingId) {
+                    // Check if already added (avoid duplicates)
+                    var alreadyAdded = false;
+                    for (var i = 0; i < invoiceMap[invoiceId].paymentApplications.length; i++) {
+                        if (invoiceMap[invoiceId].paymentApplications[i].id === applyingId) {
+                            alreadyAdded = true;
+                            break;
+                        }
+                    }
+
+                    if (!alreadyAdded) {
+                        // Lookup transaction ID from the applying transaction
+                        var applyingTranId = '';
+                        try {
+                            var applyingLookup = search.lookupFields({
+                                type: search.Type.TRANSACTION,
+                                id: applyingId,
+                                columns: ['tranid']
+                            });
+                            applyingTranId = applyingLookup.tranid || '';
+                        } catch (e) {
+                            log.error('Error looking up applying transaction', e);
+                        }
+
+                        var application = {
+                            id: applyingId,
+                            tranid: applyingTranId,
+                            type: applyingType,
+                            date: applyingDate,
+                            amount: parseFloat(applyingTotal) || 0,
+                            memo: applyingMemo
+                        };
+
+                        // Add deposit details if this is a DEPA
+                        if (depositId) {
+                            try {
+                                var depositLookup = search.lookupFields({
+                                    type: search.Type.CUSTOMER_DEPOSIT,
+                                    id: depositId,
+                                    columns: ['tranid', 'trandate', 'total']
+                                });
+                                
+                                application.sourceDeposit = {
+                                    id: depositId,
+                                    tranid: depositLookup.tranid || '',
+                                    date: depositLookup.trandate || '',
+                                    amount: parseFloat(depositLookup.total) || 0
+                                };
+                            } catch (e) {
+                                log.error('Error looking up deposit', { depositId: depositId, error: e });
+                            }
+                        }
+
+                        invoiceMap[invoiceId].paymentApplications.push(application);
+
+                        log.debug('Payment Application Added', {
+                            invoiceId: invoiceId,
+                            invoiceTranId: tranid,
+                            applyingId: applyingId,
+                            applyingTranId: applyingTranId,
+                            applyingType: applyingType,
+                            hasDeposit: !!depositId
+                        });
+                    }
+                }
+
+                return true; // Continue processing
+            });
+
+            // Convert map to array
+            var results = [];
+            for (var invoiceId in invoiceMap) {
+                if (invoiceMap.hasOwnProperty(invoiceId)) {
+                    results.push(invoiceMap[invoiceId]);
+                }
+            }
+
+            // Sort by tranid descending
+            results.sort(function(a, b) {
+                return b.tranid.localeCompare(a.tranid);
             });
 
             log.debug('Paid Invoices Found', {
-                count: results.length,
+                totalInvoices: results.length,
+                invoicesWithApplications: results.filter(function(inv) { 
+                    return inv.paymentApplications.length > 0; 
+                }).length,
                 sampleResult: results.length > 0 ? {
                     tranid: results[0].tranid,
                     hasDispute: results[0].hasDisputeChargeback,
-                    hasFraud: results[0].hasFraudChargeback
+                    hasFraud: results[0].hasFraudChargeback,
+                    applicationCount: results[0].paymentApplications.length
                 } : 'No results'
             });
 
@@ -7100,6 +7205,30 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '        html += "</td>";' +
                 '        html += "<td>" + escapeHtmlClient(inv.memo) + "</td>";' +
                 '        html += "</tr>";' +
+                '        if (inv.paymentApplications && inv.paymentApplications.length > 0) {' +
+                '            html += "<tr style=\\"background-color: #f8f9fa;\\">";' +
+                '            html += "<td class=\\"invoice-checkbox\\" style=\\"display: none;\\"></td>";' +
+                '            html += "<td colspan=\\"5\\" style=\\"padding-left: 30px; font-size: 11px; color: #666;\\">";' +
+                '            html += "<strong>Payment Applications (" + inv.paymentApplications.length + "):</strong><br>";' +
+                '            for (var j = 0; j < inv.paymentApplications.length; j++) {' +
+                '                var app = inv.paymentApplications[j];' +
+                '                var typeLabel = app.type || "Unknown";' +
+                '                if (typeLabel.indexOf("Payment") !== -1) typeLabel = "Customer Payment";' +
+                '                if (typeLabel.indexOf("DepAppl") !== -1 || typeLabel.indexOf("DepApp") !== -1) typeLabel = "Deposit Application";' +
+                '                if (typeLabel.indexOf("CustCred") !== -1) typeLabel = "Credit Memo";' +
+                '                html += "<div style=\\"margin: 4px 0; padding-left: 15px;\\">";' +
+                '                html += "• " + typeLabel + " <a href=\\"/app/accounting/transactions/transaction.nl?id=" + app.id + "\\" target=\\"_blank\\">" + escapeHtmlClient(app.tranid) + "</a>: ";' +
+                '                html += "<strong>$" + app.amount.toFixed(2) + "</strong> on " + escapeHtmlClient(app.date);' +
+                '                if (app.sourceDeposit) {' +
+                '                    html += "<br><span style=\\"padding-left: 20px; color: #28a745;\\">└─ From Customer Deposit ";' +
+                '                    html += "<a href=\\"/app/accounting/transactions/custdep.nl?id=" + app.sourceDeposit.id + "\\" target=\\"_blank\\">" + escapeHtmlClient(app.sourceDeposit.tranid) + "</a>";' +
+                '                    html += " ($" + app.sourceDeposit.amount.toFixed(2) + " total)</span>";' +
+                '                }' +
+                '                html += "</div>";' +
+                '            }' +
+                '            html += "</td>";' +
+                '            html += "</tr>";' +
+                '        }' +
                 '    }' +
                 '    html += "</tbody></table>";' +
                 '    html += "<div id=\\"multi-select-summary\\" style=\\"display: none; margin-top: 15px; padding: 15px; background-color: #f8f9fa; border: 2px solid #007bff; border-radius: 6px;\\">";' +
