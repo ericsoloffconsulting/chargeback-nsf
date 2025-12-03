@@ -1748,51 +1748,216 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             }
         }
 
-        /**
- * Merges all files attached to a response record into a single PDF using PDF.co API
- * 
- * Creates a combined PDF document from all files attached to a chargeback response record.
- * The function:
- * 1. Retrieves all attached files from the response record
- * 2. Makes files temporarily public for PDF.co to access
- * 3. Calls PDF.co /pdf/merge2 endpoint to merge files (auto-converts non-PDFs)
- * 4. Downloads the merged PDF and saves it to NetSuite File Cabinet
- * 5. Attaches the merged PDF back to the response record
- * 
- * Filename format: DISPUTE_SUBMISSION_[CustomerID]_[CustomerName].pdf
- * 
- * @param {string} responseRecordId - Internal ID of the chargeback response custom record
- * @param {string} invoiceTranId - Transaction ID of the related invoice (used for logging only)
- * @returns {Object} Result object with the following properties:
- * @returns {boolean} returns.success - Whether the merge operation succeeded
- * @returns {string} [returns.mergedFileId] - Internal ID of the created merged PDF file (if successful)
- * @returns {string} [returns.mergedFileName] - Name of the created merged PDF file (if successful)
- * @returns {number} [returns.originalFileCount] - Number of files that were merged (if successful)
- * @returns {string} [returns.error] - Error message (if unsuccessful)
- * @returns {string} [returns.message] - Informational message (e.g., "No files to merge")
- * 
- * @throws Does not throw - returns error object instead
- * 
- * @requires N/record - For loading response and customer records
- * @requires N/file - For file operations
- * @requires N/https - For PDF.co API calls
- * @requires N/runtime - For script parameters (API key)
- * @requires Script Parameter: custscript_pdfco_api_key - PDF.co API key
- * 
- * @example
- * var result = mergeAttachedFilesIntoPDF('12345', 'INV-2024-001');
- * if (result.success) {
- *     log.audit('PDF Merged', 'File ID: ' + result.mergedFileId);
- * } else {
- *     log.error('Merge Failed', result.error);
- * }
- */
 
-        function mergeAttachedFilesIntoPDF(responseRecordId, invoiceTranId) {
+        /**
+     * Compresses a PDF file using PDF.co v2 compress endpoint with aggressive compression settings
+     * @param {string} fileUrl - Public URL of the PDF file
+     * @param {string} apiKey - PDF.co API key
+     * @returns {Object} Result with compressed file URL
+     */
+        function compressPdfFile(fileUrl, apiKey) {
+            try {
+                log.debug('Starting PDF Compression', {
+                    fileUrl: fileUrl,
+                    apiVersion: 'v2'
+                });
+
+                // NEW: Use v2 API with config object instead of profiles
+                var jsonPayload = JSON.stringify({
+                    url: fileUrl,
+                    async: false,
+                    config: {
+                        images: {
+                            color: {
+                                skip: false,
+                                downsample: {
+                                    skip: false,
+                                    downsample_ppi: 150,
+                                    threshold_ppi: 225
+                                },
+                                compression: {
+                                    skip: false,
+                                    compression_format: "jpeg",
+                                    compression_params: {
+                                        quality: 60  // Lower quality = smaller file size
+                                    }
+                                }
+                            },
+                            grayscale: {
+                                skip: false,
+                                downsample: {
+                                    skip: false,
+                                    downsample_ppi: 150,
+                                    threshold_ppi: 225
+                                },
+                                compression: {
+                                    skip: false,
+                                    compression_format: "jpeg",
+                                    compression_params: {
+                                        quality: 60
+                                    }
+                                }
+                            },
+                            monochrome: {
+                                skip: false,
+                                downsample: {
+                                    skip: false,
+                                    downsample_ppi: 300,
+                                    threshold_ppi: 450
+                                },
+                                compression: {
+                                    skip: false,
+                                    compression_format: "ccitt_g4",
+                                    compression_params: {}
+                                }
+                            }
+                        },
+                        save: {
+                            garbage: 4  // Remove unused objects
+                        }
+                    }
+                });
+
+                // NEW: Use v2 endpoint
+                var response = https.post({
+                    url: 'https://api.pdf.co/v2/pdf/compress',
+                    body: jsonPayload,
+                    headers: {
+                        'x-api-key': apiKey,
+                        'Content-Type': 'application/json'
+                    }
+                });
+
+                log.debug('PDF.co Compression Response', {
+                    statusCode: response.code,
+                    responseBody: response.body
+                });
+
+                if (response.code === 200) {
+                    var data = JSON.parse(response.body);
+                    if (data.error === false) {
+                        log.debug('PDF Compression Successful', {
+                            originalUrl: fileUrl,
+                            compressedUrl: data.url
+                        });
+
+                        return {
+                            success: true,
+                            url: data.url
+                        };
+                    } else {
+                        log.error('PDF.co Compression Error', {
+                            error: data.message,
+                            originalUrl: fileUrl
+                        });
+
+                        return {
+                            success: false,
+                            error: data.message || 'Unknown PDF.co error'
+                        };
+                    }
+                } else {
+                    log.error('PDF.co API Request Failed', {
+                        statusCode: response.code,
+                        responseBody: response.body,
+                        originalUrl: fileUrl
+                    });
+
+                    return {
+                        success: false,
+                        error: 'HTTP ' + response.code + ' - ' + response.body
+                    };
+                }
+            } catch (e) {
+                log.error('PDF Compression Exception', {
+                    error: e.toString(),
+                    stack: e.stack,
+                    fileUrl: fileUrl
+                });
+
+                return {
+                    success: false,
+                    error: e.toString()
+                };
+            }
+        }
+
+        /**
+        * Merges all files attached to a response record into a single PDF using PDF.co API
+        * 
+        * Creates a combined PDF document from all files attached to a chargeback response record.
+        * The function:
+        * 1. Retrieves all attached files from the response record (excluding old generated files)
+        * 2. Filters out old dispute submissions, cover letters, and return policies
+        * 3. Makes files temporarily public for PDF.co to access
+        * 4. Compresses PDF files using PDF.co's "max" compression profile for optimal file size reduction
+        * 5. Orders files: Cover Letter → Other Files → Return Policy
+        * 6. Calls PDF.co /pdf/merge2 endpoint to merge files (auto-converts non-PDFs)
+        * 7. Downloads the merged PDF and saves it to NetSuite File Cabinet
+        * 8. Attaches the merged PDF back to the response record
+        * 
+        * Filename format: DISPUTE_SUBMISSION_[CustomerID]_[CustomerName].pdf
+        * 
+        * PDF Compression:
+        * - Only PDF files are compressed (images, Word docs, etc. are skipped)
+        * - Uses PDF.co's "max" compression profile for maximum file size reduction
+        * - Falls back to original file if compression fails (process continues)
+        * - Tracks detailed compression statistics (attempted, successful, failed, skipped)
+        * - Compression profile may reduce image quality but is ideal for file size limits
+        * 
+        * @param {string} responseRecordId - Internal ID of the chargeback response custom record
+        * @param {string} invoiceTranId - Transaction ID of the related invoice (used for logging only)
+        * @param {string} newCoverLetterId - Internal ID of the newly created cover letter (to keep it)
+        * @param {string} newReturnPolicyId - Internal ID of the newly attached return policy (to keep it)
+        * @returns {Object} Result object with the following properties:
+        * @returns {boolean} returns.success - Whether the merge operation succeeded
+        * @returns {string} [returns.mergedFileId] - Internal ID of the created merged PDF file (if successful)
+        * @returns {string} [returns.mergedFileName] - Name of the created merged PDF file (if successful)
+        * @returns {number} [returns.originalFileCount] - Number of files that were merged (if successful)
+        * @returns {Object} [returns.compressionStats] - Compression statistics object (if successful)
+        * @returns {number} [returns.compressionStats.attempted] - Number of PDF files compression was attempted on
+        * @returns {number} [returns.compressionStats.successful] - Number of PDFs successfully compressed
+        * @returns {number} [returns.compressionStats.failed] - Number of PDFs that failed compression
+        * @returns {number} [returns.compressionStats.skippedNonPdf] - Number of non-PDF files skipped
+        * @returns {string} [returns.error] - Error message (if unsuccessful)
+        * @returns {string} [returns.message] - Informational message (e.g., "No files to merge")
+        * 
+        * @throws Does not throw - returns error object instead
+        * 
+        * @requires N/record - For loading response and customer records
+        * @requires N/file - For file operations
+        * @requires N/https - For PDF.co API calls
+        * @requires N/runtime - For script parameters (API key)
+        * @requires Script Parameter: custscript_pdfco_api_key - PDF.co API key
+        * 
+        * @example
+        * var result = mergeAttachedFilesIntoPDF('12345', 'INV-2024-001', '67890', '67891');
+        * if (result.success) {
+        *     log.audit('PDF Merged', {
+        *         fileId: result.mergedFileId,
+        *         fileName: result.mergedFileName,
+        *         compressionStats: result.compressionStats
+        *     });
+        * } else {
+        *     log.error('Merge Failed', result.error);
+        * }
+        * 
+        * @example Compression Statistics Object
+        * {
+        *     attempted: 5,        // 5 PDF files processed
+        *     successful: 4,       // 4 PDFs compressed successfully
+        *     failed: 1,          // 1 PDF compression failed (used original)
+        *     skippedNonPdf: 2    // 2 non-PDF files (images, Word docs)
+        * }
+        */
+
+        function mergeAttachedFilesIntoPDF(responseRecordId, invoiceTranId, newCoverLetterId, newReturnPolicyId) {
             try {
                 log.debug('Merging Attached Files into PDF using PDF.co', {
                     responseRecordId: responseRecordId,
-                    invoiceTranId: invoiceTranId
+                    invoiceTranId: invoiceTranId,
+                    newCoverLetterId: newCoverLetterId,
+                    newReturnPolicyId: newReturnPolicyId
                 });
 
                 // Get script parameter for PDF.co API key
@@ -1809,20 +1974,85 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     };
                 }
 
-                // Get all attached files
-                var attachedFiles = searchFilesAttachedToRecord(responseRecordId);
+                // Get ALL attached files WITHOUT exclusions
+                var attachedFiles = searchFilesAttachedToRecord(responseRecordId, false);
 
                 if (attachedFiles.length === 0) {
-                    log.debug('No files to merge');
+                    log.debug('No files to merge after excluding auto-generated files');
                     return { success: false, message: 'No files to merge' };
                 }
 
-                log.debug('Files to merge', {
-                    count: attachedFiles.length,
-                    files: attachedFiles.map(function (f) { return f.name; })
+                log.debug('All Attached Files Retrieved', {
+                    totalCount: attachedFiles.length,
+                    files: attachedFiles.map(function (f) {
+                        return {
+                            id: f.id,
+                            name: f.name,
+                            isNewCoverLetter: f.id === newCoverLetterId,
+                            isNewReturnPolicy: f.id === newReturnPolicyId
+                        };
+                    })
                 });
 
-                // NEW: Load response record to get customer info
+                // Manually filter - exclude only OLD merged documents and OLD versions
+                var filesToMerge = [];
+
+                for (var i = 0; i < attachedFiles.length; i++) {
+                    var f = attachedFiles[i];
+                    var lowerFileName = f.name.toLowerCase();
+
+                    // Skip ONLY old dispute submissions
+                    if (lowerFileName.indexOf('dispute_submission_') === 0) {
+                        log.debug('Excluding Old Merged Document', {
+                            fileId: f.id,
+                            fileName: f.name
+                        });
+                        continue;
+                    }
+
+                    // Skip old cover letters ONLY IF this is NOT the new one
+                    if (lowerFileName.indexOf('cover_letter_') === 0 && f.id != newCoverLetterId) {
+                        log.debug('Excluding Old Cover Letter', {
+                            fileId: f.id,
+                            fileName: f.name,
+                            newCoverLetterId: newCoverLetterId
+                        });
+                        continue;
+                    }
+
+                    // Skip old return policies ONLY IF this is NOT the new one
+                    if (lowerFileName === 'return_policy.pdf' && f.id != newReturnPolicyId) {
+                        log.debug('Excluding Old Return Policy', {
+                            fileId: f.id,
+                            fileName: f.name,
+                            newReturnPolicyId: newReturnPolicyId
+                        });
+                        continue;
+                    }
+
+                    // Include this file
+                    filesToMerge.push(f);
+
+                    log.debug('Including File in Merge', {
+                        fileId: f.id,
+                        fileName: f.name,
+                        isNewCoverLetter: f.id == newCoverLetterId,
+                        isNewReturnPolicy: f.id == newReturnPolicyId
+                    });
+                }
+
+                if (filesToMerge.length === 0) {
+                    log.debug('No files remaining after filtering');
+                    return { success: false, message: 'No files to merge after filtering' };
+                }
+
+                log.debug('Files After Filtering', {
+                    originalCount: attachedFiles.length,
+                    afterFilteringCount: filesToMerge.length,
+                    excluded: attachedFiles.length - filesToMerge.length
+                });
+
+                // Load response record to get customer info
                 var responseRecord = record.load({
                     type: 'customrecord_chargeback_response',
                     id: responseRecordId,
@@ -1840,8 +2070,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
                 var customerEntityId = customerRecord.getValue('entityid');
                 var customerName = customerRecord.getValue('companyname') || customerRecord.getValue('altname') || customerEntityId;
-
-                // Clean customer name for filename (remove special characters)
                 var cleanCustomerName = customerName.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 50);
 
                 log.debug('Customer Info Retrieved', {
@@ -1851,18 +2079,77 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     cleanCustomerName: cleanCustomerName
                 });
 
-                // Prepare file URLs for PDF.co API
+                // Sort files into ordered buckets
+                var coverLetterFile = null;
+                var otherFiles = [];
+                var returnPolicyFile = null;
+
+                for (var i = 0; i < filesToMerge.length; i++) {
+                    var fileName = filesToMerge[i].name.toLowerCase();
+
+                    if (filesToMerge[i].id == newCoverLetterId) {
+                        coverLetterFile = filesToMerge[i];
+                        log.debug('Found NEW Cover Letter', {
+                            fileId: filesToMerge[i].id,
+                            fileName: filesToMerge[i].name
+                        });
+                    } else if (filesToMerge[i].id == newReturnPolicyId) {
+                        returnPolicyFile = filesToMerge[i];
+                        log.debug('Found NEW Return Policy', {
+                            fileId: filesToMerge[i].id,
+                            fileName: filesToMerge[i].name
+                        });
+                    } else {
+                        otherFiles.push(filesToMerge[i]);
+                    }
+                }
+
+                // Build ordered file array: Cover Letter, Other Files, Return Policy
+                var orderedFiles = [];
+
+                if (coverLetterFile) {
+                    orderedFiles.push(coverLetterFile);
+                } else {
+                    log.error('NEW Cover Letter Missing', 'Expected to find cover letter with ID: ' + newCoverLetterId);
+                }
+
+                orderedFiles = orderedFiles.concat(otherFiles);
+
+                if (returnPolicyFile) {
+                    orderedFiles.push(returnPolicyFile);
+                } else {
+                    log.error('NEW Return Policy Missing', 'Expected to find return policy with ID: ' + newReturnPolicyId);
+                }
+
+                log.debug('Files Ordered for Merging', {
+                    hasCoverLetter: !!coverLetterFile,
+                    coverLetterId: coverLetterFile ? coverLetterFile.id : 'MISSING',
+                    otherFilesCount: otherFiles.length,
+                    hasReturnPolicy: !!returnPolicyFile,
+                    returnPolicyId: returnPolicyFile ? returnPolicyFile.id : 'MISSING',
+                    totalFiles: orderedFiles.length,
+                    order: orderedFiles.map(function (f) { return f.name; })
+                });
+
+                // NEW: Track compression stats
+                var compressionStats = {
+                    attempted: 0,
+                    successful: 0,
+                    failed: 0,
+                    skippedNonPdf: 0
+                };
+
+                // Prepare file URLs for PDF.co API in the correct order WITH COMPRESSION
                 var fileUrls = [];
-                for (var i = 0; i < attachedFiles.length; i++) {
+                for (var i = 0; i < orderedFiles.length; i++) {
                     var fileObj = file.load({
-                        id: attachedFiles[i].id
+                        id: orderedFiles[i].id
                     });
 
-                    // Make file public temporarily for PDF.co to access
+                    // Make file public temporarily
                     fileObj.isOnline = true;
                     var publicFileId = fileObj.save();
 
-                    // Reload to get public URL
                     var publicFile = file.load({
                         id: publicFileId
                     });
@@ -1872,16 +2159,73 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         publicUrl = 'https://system.netsuite.com' + publicUrl;
                     }
 
-                    fileUrls.push(publicUrl);
+                    // NEW: Compress PDF files before adding to merge list
+                    var finalUrl = publicUrl;
 
-                    log.debug('File made public for merging', {
-                        fileId: attachedFiles[i].id,
+                    if (fileObj.fileType === file.Type.PDF) {
+                        compressionStats.attempted++;
+
+                        log.debug('Attempting PDF Compression', {
+                            fileName: fileObj.name,
+                            originalUrl: publicUrl,
+                            fileSize: fileObj.size
+                        });
+
+                        var compressResult = compressPdfFile(publicUrl, API_KEY);
+
+                        if (compressResult.success) {
+                            finalUrl = compressResult.url;
+                            compressionStats.successful++;
+
+                            log.audit('PDF Compressed Successfully', {
+                                fileName: fileObj.name,
+                                originalUrl: publicUrl,
+                                compressedUrl: finalUrl,
+                                compressionProfile: 'max'
+                            });
+                        } else {
+                            compressionStats.failed++;
+
+                            log.error('PDF Compression Failed - Using Original', {
+                                fileName: fileObj.name,
+                                error: compressResult.error,
+                                originalUrl: publicUrl
+                            });
+                            // Continue with original URL if compression fails
+                        }
+                    } else {
+                        compressionStats.skippedNonPdf++;
+
+                        log.debug('Skipping Compression - Non-PDF File', {
+                            fileName: fileObj.name,
+                            fileType: fileObj.fileType
+                        });
+                    }
+
+                    fileUrls.push(finalUrl);
+
+                    log.debug('File Prepared for Merging', {
+                        position: i + 1,
+                        fileId: orderedFiles[i].id,
                         fileName: fileObj.name,
-                        publicUrl: publicUrl
+                        finalUrl: finalUrl,
+                        wasCompressed: fileObj.fileType === file.Type.PDF && compressResult && compressResult.success,
+                        isCoverLetter: orderedFiles[i].id == newCoverLetterId,
+                        isReturnPolicy: orderedFiles[i].id == newReturnPolicyId
                     });
                 }
 
-                // UPDATED: New filename format with customer ID and name
+                // Log compression summary
+                log.audit('PDF Compression Summary', {
+                    totalFiles: orderedFiles.length,
+                    pdfFilesAttempted: compressionStats.attempted,
+                    successful: compressionStats.successful,
+                    failed: compressionStats.failed,
+                    skippedNonPdf: compressionStats.skippedNonPdf,
+                    compressionProfile: 'max'
+                });
+
+                // Merged filename with customer ID and name
                 var mergedFileName = 'DISPUTE_SUBMISSION_' + customerEntityId + '_' + cleanCustomerName + '.pdf';
 
                 var jsonPayload = JSON.stringify({
@@ -1910,8 +2254,12 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     if (data.error == false) {
                         log.debug('PDF merge successful', {
                             mergedPdfUrl: data.url,
-                            originalFileCount: attachedFiles.length,
-                            newFileName: mergedFileName
+                            originalFileCount: filesToMerge.length,
+                            newFileName: mergedFileName,
+                            documentOrder: 'Cover Letter → Other Files → Return Policy',
+                            includedNewCoverLetter: !!coverLetterFile,
+                            includedNewReturnPolicy: !!returnPolicyFile,
+                            compressionApplied: compressionStats.successful > 0
                         });
 
                         // Download merged PDF from PDF.co
@@ -1926,7 +2274,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                                 fileType: file.Type.PDF,
                                 contents: mergedPdfResponse.body,
                                 folder: 2762649,
-                                description: 'Merged dispute files for Response Record #' + responseRecordId + ' - Customer: ' + customerName
+                                description: 'Merged dispute files for Response Record #' + responseRecordId + ' - Customer: ' + customerName + ' (Compressed with PDF.co max profile)'
                             });
 
                             var mergedFileId = mergedFileObj.save();
@@ -1946,16 +2294,21 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                                 mergedFileId: mergedFileId,
                                 mergedFileName: mergedFileName,
                                 responseRecordId: responseRecordId,
-                                originalFileCount: attachedFiles.length,
+                                originalFileCount: filesToMerge.length,
                                 customerId: customerId,
-                                customerName: customerName
+                                customerName: customerName,
+                                documentOrder: 'Cover Letter first, Return Policy last',
+                                verifiedNewCoverLetter: coverLetterFile ? 'Included - ID: ' + coverLetterFile.id : 'MISSING',
+                                verifiedNewReturnPolicy: returnPolicyFile ? 'Included - ID: ' + returnPolicyFile.id : 'MISSING',
+                                compressionStats: compressionStats
                             });
 
                             return {
                                 success: true,
                                 mergedFileId: mergedFileId,
                                 mergedFileName: mergedFileName,
-                                originalFileCount: attachedFiles.length
+                                originalFileCount: filesToMerge.length,
+                                compressionStats: compressionStats
                             };
                         } else {
                             log.error('Failed to download merged PDF from PDF.co', {
@@ -2978,366 +3331,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         checklistSaved: 'true'
                     }
                 });
-            }
-        }
-
-
-        /**
- * Merges all files attached to a response record into a single PDF using PDF.co API
- * FIXED: Properly identify new cover letter and return policy files to include them
- * @param {string} responseRecordId - Internal ID of the chargeback response custom record
- * @param {string} invoiceTranId - Transaction ID of the related invoice (used for logging only)
- * @param {string} newCoverLetterId - Internal ID of the newly created cover letter (to keep it)
- * @param {string} newReturnPolicyId - Internal ID of the newly attached return policy (to keep it)
- * @returns {Object} Result object
- */
-        function mergeAttachedFilesIntoPDF(responseRecordId, invoiceTranId, newCoverLetterId, newReturnPolicyId) {
-            try {
-                log.debug('Merging Attached Files into PDF using PDF.co', {
-                    responseRecordId: responseRecordId,
-                    invoiceTranId: invoiceTranId,
-                    newCoverLetterId: newCoverLetterId,
-                    newReturnPolicyId: newReturnPolicyId
-                });
-
-                // Get script parameter for PDF.co API key
-                var script = runtime.getCurrentScript();
-                var API_KEY = script.getParameter({
-                    name: 'custscript_pdfco_api_key'
-                });
-
-                if (!API_KEY) {
-                    log.error('Missing PDF.co API Key parameter');
-                    return {
-                        success: false,
-                        error: 'PDF.co API Key parameter not configured'
-                    };
-                }
-
-                // UPDATED: Get ALL attached files WITHOUT exclusions
-                var attachedFiles = searchFilesAttachedToRecord(responseRecordId, false); // Pass false - get ALL files
-
-                if (attachedFiles.length === 0) {
-                    log.debug('No files to merge after excluding auto-generated files');
-                    return { success: false, message: 'No files to merge' };
-                }
-
-                log.debug('All Attached Files Retrieved', {
-                    totalCount: attachedFiles.length,
-                    files: attachedFiles.map(function (f) {
-                        return {
-                            id: f.id,
-                            name: f.name,
-                            isNewCoverLetter: f.id === newCoverLetterId,
-                            isNewReturnPolicy: f.id === newReturnPolicyId
-                        };
-                    })
-                });
-
-                // FIXED: Manually filter - exclude only OLD merged documents and OLD versions
-                var filesToMerge = [];
-
-                for (var i = 0; i < attachedFiles.length; i++) {
-                    var f = attachedFiles[i];
-                    var lowerFileName = f.name.toLowerCase();
-
-                    // Skip ONLY old dispute submissions (not cover letters or return policies)
-                    if (lowerFileName.indexOf('dispute_submission_') === 0) {
-                        log.debug('Excluding Old Merged Document', {
-                            fileId: f.id,
-                            fileName: f.name
-                        });
-                        continue; // Skip this file
-                    }
-
-                    // FIXED: Skip old cover letters ONLY IF this is NOT the new one we just created
-                    // Use == for comparison to handle string vs number
-                    if (lowerFileName.indexOf('cover_letter_') === 0 && f.id != newCoverLetterId) {
-                        log.debug('Excluding Old Cover Letter', {
-                            fileId: f.id,
-                            fileName: f.name,
-                            newCoverLetterId: newCoverLetterId,
-                            reason: 'Old version - new cover letter ID is ' + newCoverLetterId
-                        });
-                        continue; // Skip old cover letter
-                    }
-
-                    // FIXED: Skip old return policies ONLY IF this is NOT the new one we just attached
-                    // Use == for comparison to handle string vs number
-                    if (lowerFileName === 'return_policy.pdf' && f.id != newReturnPolicyId) {
-                        log.debug('Excluding Old Return Policy', {
-                            fileId: f.id,
-                            fileName: f.name,
-                            newReturnPolicyId: newReturnPolicyId,
-                            reason: 'Old version - new return policy ID is ' + newReturnPolicyId
-                        });
-                        continue; // Skip old return policy
-                    }
-
-                    // Include this file
-                    filesToMerge.push(f);
-
-                    log.debug('Including File in Merge', {
-                        fileId: f.id,
-                        fileName: f.name,
-                        isNewCoverLetter: f.id == newCoverLetterId,
-                        isNewReturnPolicy: f.id == newReturnPolicyId
-                    });
-                }
-
-                if (filesToMerge.length === 0) {
-                    log.debug('No files remaining after filtering');
-                    return { success: false, message: 'No files to merge after filtering' };
-                }
-
-                log.debug('Files After Filtering', {
-                    originalCount: attachedFiles.length,
-                    afterFilteringCount: filesToMerge.length,
-                    excluded: attachedFiles.length - filesToMerge.length
-                });
-
-                // Load response record to get customer info
-                var responseRecord = record.load({
-                    type: 'customrecord_chargeback_response',
-                    id: responseRecordId,
-                    isDynamic: false
-                });
-
-                var customerId = responseRecord.getValue('custrecord_customer');
-
-                // Load customer record to get customer name
-                var customerRecord = record.load({
-                    type: record.Type.CUSTOMER,
-                    id: customerId,
-                    isDynamic: false
-                });
-
-                var customerEntityId = customerRecord.getValue('entityid');
-                var customerName = customerRecord.getValue('companyname') || customerRecord.getValue('altname') || customerEntityId;
-
-                // Clean customer name for filename (remove special characters)
-                var cleanCustomerName = customerName.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 50);
-
-                log.debug('Customer Info Retrieved', {
-                    customerId: customerId,
-                    customerEntityId: customerEntityId,
-                    customerName: customerName,
-                    cleanCustomerName: cleanCustomerName
-                });
-
-                // Sort files into ordered buckets
-                var coverLetterFile = null;
-                var otherFiles = [];
-                var returnPolicyFile = null;
-
-                for (var i = 0; i < filesToMerge.length; i++) {
-                    var fileName = filesToMerge[i].name.toLowerCase();
-
-                    // FIXED: Identify NEW cover letter by ID using == comparison
-                    if (filesToMerge[i].id == newCoverLetterId) {
-                        coverLetterFile = filesToMerge[i];
-                        log.debug('Found NEW Cover Letter', {
-                            fileId: filesToMerge[i].id,
-                            fileName: filesToMerge[i].name
-                        });
-                    }
-                    // FIXED: Identify NEW return policy by ID using == comparison
-                    else if (filesToMerge[i].id == newReturnPolicyId) {
-                        returnPolicyFile = filesToMerge[i];
-                        log.debug('Found NEW Return Policy', {
-                            fileId: filesToMerge[i].id,
-                            fileName: filesToMerge[i].name
-                        });
-                    }
-                    // Everything else goes in the middle
-                    else {
-                        otherFiles.push(filesToMerge[i]);
-                    }
-                }
-
-                // Build ordered file array: Cover Letter, Other Files, Return Policy
-                var orderedFiles = [];
-
-                if (coverLetterFile) {
-                    orderedFiles.push(coverLetterFile);
-                } else {
-                    log.error('NEW Cover Letter Missing', 'Expected to find cover letter with ID: ' + newCoverLetterId);
-                }
-
-                orderedFiles = orderedFiles.concat(otherFiles);
-
-                if (returnPolicyFile) {
-                    orderedFiles.push(returnPolicyFile);
-                } else {
-                    log.error('NEW Return Policy Missing', 'Expected to find return policy with ID: ' + newReturnPolicyId);
-                }
-
-                log.debug('Files Ordered for Merging', {
-                    hasCoverLetter: !!coverLetterFile,
-                    coverLetterId: coverLetterFile ? coverLetterFile.id : 'MISSING',
-                    otherFilesCount: otherFiles.length,
-                    hasReturnPolicy: !!returnPolicyFile,
-                    returnPolicyId: returnPolicyFile ? returnPolicyFile.id : 'MISSING',
-                    totalFiles: orderedFiles.length,
-                    order: orderedFiles.map(function (f) { return f.name; })
-                });
-
-                // Prepare file URLs for PDF.co API in the correct order
-                var fileUrls = [];
-                for (var i = 0; i < orderedFiles.length; i++) {
-                    var fileObj = file.load({
-                        id: orderedFiles[i].id
-                    });
-
-                    // Make file public temporarily for PDF.co to access
-                    fileObj.isOnline = true;
-                    var publicFileId = fileObj.save();
-
-                    // Reload to get public URL
-                    var publicFile = file.load({
-                        id: publicFileId
-                    });
-
-                    var publicUrl = publicFile.url;
-                    if (publicUrl && publicUrl.indexOf('http') !== 0) {
-                        publicUrl = 'https://system.netsuite.com' + publicUrl;
-                    }
-
-                    fileUrls.push(publicUrl);
-
-                    log.debug('File made public for merging', {
-                        position: i + 1,
-                        fileId: orderedFiles[i].id,
-                        fileName: fileObj.name,
-                        publicUrl: publicUrl,
-                        isCoverLetter: orderedFiles[i].id == newCoverLetterId,
-                        isReturnPolicy: orderedFiles[i].id == newReturnPolicyId
-                    });
-                }
-
-                // Merged filename with customer ID and name
-                var mergedFileName = 'DISPUTE_SUBMISSION_' + customerEntityId + '_' + cleanCustomerName + '.pdf';
-
-                var jsonPayload = JSON.stringify({
-                    url: fileUrls.join(','),
-                    name: mergedFileName,
-                    async: false
-                });
-
-                var response = https.post({
-                    url: 'https://api.pdf.co/v1/pdf/merge2',
-                    body: jsonPayload,
-                    headers: {
-                        'x-api-key': API_KEY,
-                        'Content-Type': 'application/json'
-                    }
-                });
-
-                log.debug('PDF.co API Response', {
-                    statusCode: response.code,
-                    responseBody: response.body
-                });
-
-                if (response.code === 200) {
-                    var data = JSON.parse(response.body);
-
-                    if (data.error == false) {
-                        log.debug('PDF merge successful', {
-                            mergedPdfUrl: data.url,
-                            originalFileCount: filesToMerge.length,
-                            newFileName: mergedFileName,
-                            documentOrder: 'Cover Letter → Other Files → Return Policy',
-                            includedNewCoverLetter: !!coverLetterFile,
-                            includedNewReturnPolicy: !!returnPolicyFile
-                        });
-
-                        // Download merged PDF from PDF.co
-                        var mergedPdfResponse = https.get({
-                            url: data.url
-                        });
-
-                        if (mergedPdfResponse.code === 200) {
-                            // Save merged PDF to NetSuite
-                            var mergedFileObj = file.create({
-                                name: mergedFileName,
-                                fileType: file.Type.PDF,
-                                contents: mergedPdfResponse.body,
-                                folder: 2762649,
-                                description: 'Merged dispute files for Response Record #' + responseRecordId + ' - Customer: ' + customerName
-                            });
-
-                            var mergedFileId = mergedFileObj.save();
-
-                            log.debug('Merged PDF saved to NetSuite', {
-                                fileId: mergedFileId,
-                                fileName: mergedFileName
-                            });
-
-                            // Attach merged PDF to response record
-                            record.attach({
-                                record: { type: 'file', id: mergedFileId },
-                                to: { type: 'customrecord_chargeback_response', id: responseRecordId }
-                            });
-
-                            log.audit('Merged PDF Attached to Response Record', {
-                                mergedFileId: mergedFileId,
-                                mergedFileName: mergedFileName,
-                                responseRecordId: responseRecordId,
-                                originalFileCount: filesToMerge.length,
-                                customerId: customerId,
-                                customerName: customerName,
-                                documentOrder: 'Cover Letter first, Return Policy last',
-                                verifiedNewCoverLetter: coverLetterFile ? 'Included - ID: ' + coverLetterFile.id : 'MISSING',
-                                verifiedNewReturnPolicy: returnPolicyFile ? 'Included - ID: ' + returnPolicyFile.id : 'MISSING'
-                            });
-
-                            return {
-                                success: true,
-                                mergedFileId: mergedFileId,
-                                mergedFileName: mergedFileName,
-                                originalFileCount: filesToMerge.length
-                            };
-                        } else {
-                            log.error('Failed to download merged PDF from PDF.co', {
-                                statusCode: mergedPdfResponse.code,
-                                url: data.url
-                            });
-                            return {
-                                success: false,
-                                error: 'Failed to download merged PDF: HTTP ' + mergedPdfResponse.code
-                            };
-                        }
-                    } else {
-                        log.error('PDF.co merge error', {
-                            error: data.message
-                        });
-                        return {
-                            success: false,
-                            error: data.message
-                        };
-                    }
-                } else {
-                    log.error('PDF.co API request failed', {
-                        statusCode: response.code,
-                        responseBody: response.body
-                    });
-                    return {
-                        success: false,
-                        error: 'HTTP ' + response.code
-                    };
-                }
-
-            } catch (e) {
-                log.error('Error Merging Files into PDF', {
-                    error: e.toString(),
-                    stack: e.stack,
-                    responseRecordId: responseRecordId,
-                    message: e.message
-                });
-                return {
-                    success: false,
-                    error: e.toString()
-                };
             }
         }
 
@@ -5362,7 +5355,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
         /**
     * Processes chargeback or NSF check for an invoice
-    * UPDATED: Support partial amounts
+    * UPDATED: Compact memo format with detailed breakdown
     * @param {string} invoiceId - Internal ID of the original invoice
     * @param {string} type - 'chargeback', 'fraud', or 'nsf'
     * @param {string} partialAmount - Optional partial amount (if not provided, uses full invoice amount)
@@ -5376,20 +5369,20 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             });
 
             var itemId;
-            var memoText;
+            var memoPrefix;
             var checkboxField;
 
             if (type === 'nsf') {
                 itemId = '304417';
-                memoText = 'NSF Check';
+                memoPrefix = 'NSF CHECK';
                 checkboxField = 'custbody_bas_nsf_check';
             } else if (type === 'fraud') {
                 itemId = '304429';
-                memoText = 'Fraud Chargeback';
+                memoPrefix = 'FRAUD CHARGEBACK';
                 checkboxField = 'custbody_bas_fraud';
             } else {
                 itemId = '304416';
-                memoText = 'Credit Card Chargeback';
+                memoPrefix = 'DISPUTE CHARGEBACK';
                 checkboxField = 'custbody_bas_cc_dispute';
             }
 
@@ -5406,8 +5399,10 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             var classField = originalInvoice.getValue('class');
             var originalTranId = originalInvoice.getValue('tranid');
 
-            // NEW: Determine amount to use (partial or full)
+            // Determine amount to use (partial or full)
             var amountToProcess;
+            var isPartial = false;
+
             if (partialAmount && partialAmount.trim() !== '') {
                 amountToProcess = parseFloat(partialAmount);
 
@@ -5419,6 +5414,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 if (amountToProcess > fullInvoiceAmount) {
                     throw new Error('Partial amount ($' + amountToProcess.toFixed(2) + ') cannot exceed invoice amount ($' + fullInvoiceAmount.toFixed(2) + ')');
                 }
+
+                isPartial = true;
 
                 log.audit('Using Partial Amount', {
                     partialAmount: amountToProcess,
@@ -5480,7 +5477,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 fieldId: 'item',
                 value: itemId
             });
-            // NEW: Use amountToProcess instead of originalAmount
             creditMemo.setCurrentSublistValue({
                 sublistId: 'item',
                 fieldId: 'amount',
@@ -5513,9 +5509,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
             creditMemo.commitLine({ sublistId: 'item' });
 
-            // NEW: Update memo to indicate if partial amount
-            var creditMemoMemo = memoText;
-            if (amountToProcess < fullInvoiceAmount) {
+            // Credit memo memo
+            var creditMemoMemo = memoPrefix;
+            if (isPartial) {
                 creditMemoMemo += ' - PARTIAL AMOUNT: $' + amountToProcess.toFixed(2) + ' of $' + fullInvoiceAmount.toFixed(2);
             }
             creditMemo.setValue('memo', creditMemoMemo);
@@ -5524,7 +5520,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             log.audit('Credit Memo Created', {
                 id: creditMemoId,
                 amount: amountToProcess,
-                isPartial: amountToProcess < fullInvoiceAmount
+                isPartial: isPartial
             });
 
             var creditMemoRecord = record.load({
@@ -5543,9 +5539,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             customerRefund.setValue('customer', customerId);
             customerRefund.setValue('paymentmethod', '15');
 
-            // NEW: Update memo to indicate if partial amount
-            var refundMemo = memoText;
-            if (amountToProcess < fullInvoiceAmount) {
+            var refundMemo = memoPrefix;
+            if (isPartial) {
                 refundMemo += ' - PARTIAL AMOUNT';
             }
             customerRefund.setValue('memo', refundMemo);
@@ -5564,7 +5559,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 log.error('Error Setting Refunded Transaction', 'Error: ' + e.message);
             }
 
-            // NEW: Use amountToProcess
             customerRefund.setValue('total', amountToProcess);
 
             var applyLineCount = customerRefund.getLineCount({ sublistId: 'apply' });
@@ -5586,7 +5580,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         fieldId: 'apply',
                         value: true
                     });
-                    // NEW: Use amountToProcess
                     customerRefund.setCurrentSublistValue({
                         sublistId: 'apply',
                         fieldId: 'amount',
@@ -5602,7 +5595,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             log.audit('Customer Refund Created', {
                 id: refundId,
                 amount: amountToProcess,
-                isPartial: amountToProcess < fullInvoiceAmount
+                isPartial: isPartial
             });
 
             var refundTranId = customTranId;
@@ -5641,7 +5634,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 fieldId: 'item',
                 value: itemId
             });
-            // NEW: Use amountToProcess
             newInvoice.setCurrentSublistValue({
                 sublistId: 'item',
                 fieldId: 'amount',
@@ -5674,9 +5666,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
             newInvoice.commitLine({ sublistId: 'item' });
 
-            // NEW: Update memo to show partial amount info
-            var newInvoiceMemo = memoText + ' - Original Invoice: ' + originalTranId;
-            if (amountToProcess < fullInvoiceAmount) {
+            var newInvoiceMemo = memoPrefix + ' - Original Invoice: ' + originalTranId;
+            if (isPartial) {
                 newInvoiceMemo += ' - PARTIAL AMOUNT: $' + amountToProcess.toFixed(2) + ' of $' + fullInvoiceAmount.toFixed(2);
             }
             newInvoice.setValue('memo', newInvoiceMemo);
@@ -5685,7 +5676,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             log.audit('New Invoice Created', {
                 id: newInvoiceId,
                 amount: amountToProcess,
-                isPartial: amountToProcess < fullInvoiceAmount
+                isPartial: isPartial
             });
 
             var newInvoiceRecord = record.load({
@@ -5695,10 +5686,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             });
             var newInvoiceTranId = newInvoiceRecord.getValue('tranid');
 
-            // Step 4: Update ORIGINAL invoice
+            // Step 4: Update ORIGINAL invoice with COMPACT FORMAT
             try {
-                var memoPrefix = type === 'nsf' ? 'NSF CHECK, SEE' : (type === 'fraud' ? 'FRAUD CHARGEBACK, SEE' : 'CHARGEBACK, SEE');
-
                 var originalInvoiceForUpdate = record.load({
                     type: record.Type.INVOICE,
                     id: invoiceId,
@@ -5707,11 +5696,13 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
                 var existingMemo = originalInvoiceForUpdate.getValue('memo') || '';
 
-                // NEW: Include partial amount info in memo
-                var newMemoText = memoPrefix + ' ' + newInvoiceTranId + ' AND ' + creditMemoTranId;
-                if (amountToProcess < fullInvoiceAmount) {
-                    newMemoText += ' (PARTIAL $' + amountToProcess.toFixed(2) + ')';
+                // Build compact memo format
+                var amountText = '$' + amountToProcess.toFixed(2);
+                if (isPartial) {
+                    amountText += ' of $' + fullInvoiceAmount.toFixed(2);
                 }
+
+                var newMemoText = memoPrefix + ' ' + amountText + ' → ' + newInvoiceTranId + ', ' + creditMemoTranId;
 
                 var updateMemo = existingMemo ? existingMemo + ' - ' + newMemoText : newMemoText;
 
@@ -5730,7 +5721,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     invoiceId: invoiceId,
                     newMemo: updateMemo,
                     checkboxField: checkboxField,
-                    isPartial: amountToProcess < fullInvoiceAmount
+                    isPartial: isPartial
                 });
 
             } catch (updateError) {
@@ -5753,12 +5744,13 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-         * NEW: Processes multiple invoices as a single combined chargeback/NSF transaction
-         * @param {Array} invoiceIds - Array of invoice internal IDs
-         * @param {string} type - Transaction type (chargeback, fraud, or nsf)
-         * @param {Object} partialAmounts - Object mapping invoice IDs to partial amounts
-         * @returns {Object} Result with created record details
-         */
+    * NEW: Processes multiple invoices as a single combined chargeback/NSF transaction
+    * UPDATED: Compact memo format with detailed breakdown
+    * @param {Array} invoiceIds - Array of invoice internal IDs
+    * @param {string} type - Transaction type (chargeback, fraud, or nsf)
+    * @param {Object} partialAmounts - Object mapping invoice IDs to partial amounts
+    * @returns {Object} Result with created record details
+    */
         function processMultipleChargebackOrNsf(invoiceIds, type, partialAmounts) {
             log.audit('Process Multiple Invoices - START', {
                 invoiceIds: invoiceIds,
@@ -5771,22 +5763,22 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 throw new Error('No invoice IDs provided');
             }
 
-            // Determine item ID, memo text, and checkbox field based on type
+            // Determine item ID, memo prefix, and checkbox field based on type
             var itemId;
-            var memoText;
+            var memoPrefix;
             var checkboxField;
 
             if (type === 'nsf') {
                 itemId = '304417';
-                memoText = 'NSF Check';
+                memoPrefix = 'NSF CHECK';
                 checkboxField = 'custbody_bas_nsf_check';
             } else if (type === 'fraud') {
                 itemId = '304429';
-                memoText = 'Fraud Chargeback';
+                memoPrefix = 'FRAUD CHARGEBACK';
                 checkboxField = 'custbody_bas_fraud';
             } else {
                 itemId = '304416';
-                memoText = 'Credit Card Chargeback';
+                memoPrefix = 'DISPUTE CHARGEBACK';
                 checkboxField = 'custbody_bas_cc_dispute';
             }
 
@@ -5802,9 +5794,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             var subsidiary = firstInvoice.getValue('subsidiary');
             var classField = firstInvoice.getValue('class');
 
-            // Calculate total amount and collect invoice tranids
+            // Calculate total amount and collect invoice details for breakdown
             var totalAmount = 0;
-            var invoiceTranIds = [];
+            var invoiceBreakdown = []; // Array of {tranid, amount, fullAmount, isPartial}
 
             for (var i = 0; i < invoiceIds.length; i++) {
                 var invId = invoiceIds[i];
@@ -5815,26 +5807,34 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 });
 
                 var invTranId = inv.getValue('tranid');
-                invoiceTranIds.push(invTranId);
-
                 var fullAmount = inv.getValue('total');
                 var amountToUse = fullAmount;
+                var isPartial = false;
 
                 // Check for partial amount
                 if (partialAmounts && partialAmounts[invId]) {
                     var partial = parseFloat(partialAmounts[invId]);
                     if (!isNaN(partial) && partial > 0 && partial <= fullAmount) {
                         amountToUse = partial;
+                        isPartial = true;
                     }
                 }
 
                 totalAmount += amountToUse;
 
+                invoiceBreakdown.push({
+                    tranid: invTranId,
+                    amount: amountToUse,
+                    fullAmount: fullAmount,
+                    isPartial: isPartial
+                });
+
                 log.debug('Invoice Loaded', {
                     invoiceId: invId,
                     tranId: invTranId,
                     fullAmount: fullAmount,
-                    amountUsed: amountToUse
+                    amountUsed: amountToUse,
+                    isPartial: isPartial
                 });
             }
 
@@ -5915,7 +5915,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
             creditMemo.commitLine({ sublistId: 'item' });
 
-            var creditMemoMemo = memoText + ' - COMBINED: ' + invoiceTranIds.join(', ');
+            var tranidList = invoiceBreakdown.map(function (inv) { return inv.tranid; }).join(', ');
+            var creditMemoMemo = memoPrefix + ' - COMBINED: ' + tranidList;
             creditMemo.setValue('memo', creditMemoMemo);
 
             var creditMemoId = creditMemo.save();
@@ -5941,11 +5942,11 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             customerRefund.setValue('customer', customerId);
             customerRefund.setValue('paymentmethod', '15');
 
-            var refundMemo = memoText + ' - COMBINED';
+            var refundMemo = memoPrefix + ' - COMBINED';
             customerRefund.setValue('memo', refundMemo);
 
             var refundPrefix = type === 'nsf' ? 'NSF_CHECK' : (type === 'fraud' ? 'FRAUD_CC' : 'CHARGEBACK_CC');
-            var customTranId = refundPrefix + '_COMBINED_' + invoiceTranIds[0];
+            var customTranId = refundPrefix + '_COMBINED_' + invoiceBreakdown[0].tranid;
 
             customerRefund.setValue('tranid', customTranId);
 
@@ -6063,7 +6064,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
             newInvoice.commitLine({ sublistId: 'item' });
 
-            var newInvoiceMemo = memoText + ' - COMBINED: ' + invoiceTranIds.join(', ');
+            var newInvoiceMemo = memoPrefix + ' - COMBINED: ' + tranidList;
             newInvoice.setValue('memo', newInvoiceMemo);
 
             var newInvoiceId = newInvoice.save();
@@ -6079,12 +6080,12 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             });
             var newInvoiceTranId = newInvoiceRecord.getValue('tranid');
 
-            // Step 4: Update ALL original invoices
-            var memoPrefix = type === 'nsf' ? 'NSF CHECK, SEE' : (type === 'fraud' ? 'FRAUD CHARGEBACK, SEE' : 'CHARGEBACK, SEE');
-
+            // Step 4: Update ALL original invoices with COMPACT FORMAT + BREAKDOWN
             for (var i = 0; i < invoiceIds.length; i++) {
                 try {
                     var invId = invoiceIds[i];
+                    var currentInvoice = invoiceBreakdown[i];
+
                     var originalInvoiceForUpdate = record.load({
                         type: record.Type.INVOICE,
                         id: invId,
@@ -6092,20 +6093,21 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     });
 
                     var existingMemo = originalInvoiceForUpdate.getValue('memo') || '';
-                    var originalTranId = originalInvoiceForUpdate.getValue('tranid');
 
-                    // Build list of other combined invoices
-                    var otherInvoices = [];
-                    for (var k = 0; k < invoiceTranIds.length; k++) {
-                        if (invoiceTranIds[k] !== originalTranId) {
-                            otherInvoices.push(invoiceTranIds[k]);
+                    // Build breakdown string with all component invoices
+                    var breakdownParts = [];
+                    for (var b = 0; b < invoiceBreakdown.length; b++) {
+                        var inv = invoiceBreakdown[b];
+                        var amountText = '$' + inv.amount.toFixed(2);
+                        if (inv.isPartial) {
+                            amountText += ' of $' + inv.fullAmount.toFixed(2);
                         }
+                        breakdownParts.push(inv.tranid + ' ' + amountText);
                     }
+                    var breakdownText = breakdownParts.join(' + ');
 
-                    var newMemoText = memoPrefix + ' ' + newInvoiceTranId + ' AND ' + creditMemoTranId;
-                    if (otherInvoices.length > 0) {
-                        newMemoText += ' (COMBINED WITH: ' + otherInvoices.join(', ') + ')';
-                    }
+                    // Build compact memo: NSF CHECK $450.00 → INV-2024-001, CM-2024-001 | Breakdown: INV-2023-100 $150.00 + ...
+                    var newMemoText = memoPrefix + ' $' + totalAmount.toFixed(2) + ' → ' + newInvoiceTranId + ', ' + creditMemoTranId + ' | Breakdown: ' + breakdownText;
 
                     var updateMemo = existingMemo ? existingMemo + ' - ' + newMemoText : newMemoText;
 
@@ -6122,9 +6124,10 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
                     log.audit('Original Invoice Updated', {
                         invoiceId: invId,
-                        tranId: originalTranId,
+                        tranId: currentInvoice.tranid,
                         newMemo: updateMemo,
-                        checkboxField: checkboxField
+                        checkboxField: checkboxField,
+                        isPartOfMultiple: true
                     });
 
                 } catch (updateError) {
