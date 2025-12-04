@@ -792,11 +792,15 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 var invoices = searchPaidInvoices(customerId);
                 var deposits = searchUnappliedDeposits(customerId);
                 var refunds = searchCustomerRefunds(customerId); // NEW
+                
+                // Group invoices by payment source on the server side
+                var paymentGroups = groupInvoicesByPaymentSource(invoices);
 
                 response.write(JSON.stringify({
                     invoices: invoices,
                     deposits: deposits,
-                    refunds: refunds // NEW
+                    refunds: refunds, // NEW
+                    paymentGroups: paymentGroups // NEW: Send pre-grouped data with chargeback amounts
                 }));
             } catch (e) {
                 log.error('Transaction Search Error', 'Error: ' + e.toString() + ' | Stack: ' + e.stack);
@@ -1198,6 +1202,430 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             });
 
             return results;
+        }
+
+        /**
+ * Groups paid invoices by their originating payment source
+ * Each invoice may appear under multiple sources if paid from multiple origins
+ * @param {Array} invoices - Array of invoice objects from searchPaidInvoices
+ * @returns {Array} Array of payment source group objects
+ */
+        function groupInvoicesByPaymentSource(invoices) {
+            log.debug('Grouping Invoices by Payment Source', 'Invoice count: ' + invoices.length);
+
+            var sourceMap = {}; // Map of source ID to source object
+
+            // Iterate through each invoice and its payment applications
+            for (var i = 0; i < invoices.length; i++) {
+                var invoice = invoices[i];
+                var applications = invoice.paymentApplications || [];
+
+                log.debug('Processing Invoice for Grouping', {
+                    invoiceId: invoice.id,
+                    tranid: invoice.tranid,
+                    applicationCount: applications.length
+                });
+
+                for (var j = 0; j < applications.length; j++) {
+                    var app = applications[j];
+                    var sourceId, sourceTranId, sourceType, sourceDate, sourceAmount;
+
+                    // Determine the "root" source
+                    if (app.sourceDeposit && app.sourceDeposit.id && app.sourceDeposit.tranid) {
+                        // This is a DEPA - use the Customer Deposit as the source
+                        sourceId = app.sourceDeposit.id;
+                        sourceTranId = app.sourceDeposit.tranid;
+                        sourceType = 'Customer Deposit';
+                        sourceDate = app.sourceDeposit.date;
+                        sourceAmount = app.sourceDeposit.amount;
+                    } else {
+                        // Only include Customer Payments - skip CM, JE, and other types
+                        if (app.type && app.type.indexOf('Payment') !== -1) {
+                            sourceId = app.id;
+                            sourceTranId = app.tranid;
+                            sourceType = 'Customer Payment';
+                            sourceDate = app.date;
+                            sourceAmount = app.amount;
+                        } else {
+                            // Skip Credit Memos, Journal Entries, and other non-payment sources
+                            log.debug('Skipping Non-Payment Source', {
+                                invoiceId: invoice.id,
+                                invoiceTranId: invoice.tranid,
+                                skippedType: app.type,
+                                skippedId: app.id,
+                                skippedTranId: app.tranid
+                            });
+                            continue; // Skip this application
+                        }
+                    }
+
+                    // Initialize source group if not exists
+                    if (!sourceMap[sourceId]) {
+                        // Lookup chargeback amounts from the source transaction
+                        var chargebackDisputeAmount = 0;
+                        var chargebackFraudAmount = 0;
+                        var nsfAmount = 0;
+                        
+                        try {
+                            var sourceRecordType = (app.sourceDeposit && app.sourceDeposit.id) ? search.Type.CUSTOMER_DEPOSIT : search.Type.CUSTOMER_PAYMENT;
+                            var sourceLookup = search.lookupFields({
+                                type: sourceRecordType,
+                                id: sourceId,
+                                columns: ['custbody_chargeback_amount_dispute', 'custbody_chargeback_fraud_amount', 'custbody_nsf_amount']
+                            });
+                            
+                            chargebackDisputeAmount = parseFloat(sourceLookup.custbody_chargeback_amount_dispute) || 0;
+                            chargebackFraudAmount = parseFloat(sourceLookup.custbody_chargeback_fraud_amount) || 0;
+                            nsfAmount = parseFloat(sourceLookup.custbody_nsf_amount) || 0;
+                            
+                            log.debug('Source Chargeback Amounts Loaded', {
+                                sourceId: sourceId,
+                                sourceTranId: sourceTranId,
+                                sourceType: sourceType,
+                                sourceRecordType: sourceRecordType,
+                                chargebackDisputeAmount: chargebackDisputeAmount,
+                                chargebackFraudAmount: chargebackFraudAmount,
+                                nsfAmount: nsfAmount,
+                                sourceLookup: JSON.stringify(sourceLookup)
+                            });
+                        } catch (e) {
+                            log.error('Error looking up chargeback amounts', {
+                                sourceId: sourceId,
+                                error: e.toString()
+                            });
+                        }
+                        
+                        sourceMap[sourceId] = {
+                            id: sourceId,
+                            tranid: sourceTranId,
+                            type: sourceType,
+                            date: sourceDate,
+                            totalAmount: sourceAmount,
+                            chargebackDisputeAmount: chargebackDisputeAmount,
+                            chargebackFraudAmount: chargebackFraudAmount,
+                            nsfAmount: nsfAmount,
+                            invoices: []
+                        };
+                    }
+
+                    // Add invoice to this source's list
+                    sourceMap[sourceId].invoices.push({
+                        id: invoice.id,
+                        tranid: invoice.tranid,
+                        date: invoice.date,
+                        fullAmount: invoice.amount,
+                        appliedAmount: app.amount, // Amount from THIS specific application
+                        memo: invoice.memo || '',
+                        hasDisputeChargeback: invoice.hasDisputeChargeback,
+                        hasFraudChargeback: invoice.hasFraudChargeback,
+                        applicationId: app.id,
+                        applicationTranId: app.tranid,
+                        applicationType: sourceType,
+                        sourceDepositId: app.sourceDeposit ? app.sourceDeposit.id : null,
+                        sourceDepositTranId: app.sourceDeposit ? app.sourceDeposit.tranid : null
+                    });
+
+                    log.debug('Invoice Added to Source Group', {
+                        invoiceId: invoice.id,
+                        invoiceTranId: invoice.tranid,
+                        sourceId: sourceId,
+                        sourceTranId: sourceTranId,
+                        sourceType: sourceType,
+                        appliedAmount: app.amount
+                    });
+                }
+            }
+
+            // Convert map to array
+            var results = [];
+            for (var sourceId in sourceMap) {
+                if (sourceMap.hasOwnProperty(sourceId)) {
+                    results.push(sourceMap[sourceId]);
+                }
+            }
+
+            // Sort by date descending
+            results.sort(function(a, b) {
+                return new Date(b.date) - new Date(a.date);
+            });
+
+            log.debug('Payment Source Grouping Complete', {
+                totalGroups: results.length,
+                sampleGroup: results.length > 0 ? {
+                    type: results[0].type,
+                    tranid: results[0].tranid,
+                    invoiceCount: results[0].invoices.length
+                } : 'No results'
+            });
+
+            return results;
+        }
+
+        /**
+ * Builds HTML table with payment source groups (expandable/collapsible)
+ * @param {Array} paymentGroups - Array of payment source group objects
+ * @returns {string} HTML string for the payment source groups table
+ */
+        function buildPaymentSourceGroupsTable(paymentGroups) {
+            var html = '';
+
+            // Multi-select toggle at top
+            html += '<div class="toggle-container">';
+            html += '<label class="toggle-switch">';
+            html += '<input type="checkbox" id="multi-select-checkbox" onchange="toggleMultiSelect()">';
+            html += '<span class="toggle-slider"></span>';
+            html += '</label>';
+            html += '<label for="multi-select-checkbox" class="toggle-label">Select Multiple Invoices</label>';
+            html += '</div>';
+
+            html += '<div class="payment-source-groups">';
+
+            for (var i = 0; i < paymentGroups.length; i++) {
+                var group = paymentGroups[i];
+                var groupId = 'group-' + group.id;
+
+                html += '<div class="payment-source-group">';
+                
+                // Group header (clickable to expand/collapse)
+                html += '<div class="group-header" onclick="toggleGroup(\'' + groupId + '\')">'
+                html += '<span class="expand-icon">▼</span> ';
+                html += '<strong>' + escapeHtml(group.type) + '</strong> ';
+                html += '<a href="/app/accounting/transactions/transaction.nl?id=' + group.id + '" target="_blank" onclick="event.stopPropagation()">' + escapeHtml(group.tranid) + '</a> ';
+                html += '| Date: ' + escapeHtml(group.date) + ' ';
+                html += '| Total: $' + parseFloat(group.totalAmount).toFixed(2) + ' ';
+                html += '| Invoices: ' + group.invoices.length;
+                html += '</div>';
+
+                // Group content (table of invoices)
+                html += '<div class="group-content" id="' + groupId + '">';
+                html += '<table class="search-table">';
+                html += '<thead><tr>';
+                html += '<th class="invoice-checkbox" style="display: none; width: 40px;"></th>';
+                html += '<th>Action</th>';
+                html += '<th>Invoice #</th>';
+                html += '<th>Date</th>';
+                html += '<th>Applied Amount</th>';
+                html += '<th>Full Invoice Amount</th>';
+                html += '<th>Application Trail</th>';
+                html += '<th>Memo</th>';
+                html += '</tr></thead><tbody>';
+                
+                // Add summary row showing chargeback amounts
+                html += '<tr style="background-color: #fff3cd; font-size: 11px;">';
+                html += '<td colspan="8" style="padding: 8px;">';
+                html += '<strong>Source Summary:</strong> ';
+                if (group.chargebackDisputeAmount > 0) {
+                    html += 'Dispute Chargebacks: $' + parseFloat(group.chargebackDisputeAmount).toFixed(2) + ' | ';
+                }
+                if (group.chargebackFraudAmount > 0) {
+                    html += 'Fraud Chargebacks: $' + parseFloat(group.chargebackFraudAmount).toFixed(2) + ' | ';
+                }
+                if (group.nsfAmount > 0) {
+                    html += 'NSF: $' + parseFloat(group.nsfAmount).toFixed(2) + ' | ';
+                }
+                html += 'Available: $' + (parseFloat(group.totalAmount) - (group.chargebackDisputeAmount || 0) - (group.chargebackFraudAmount || 0) - (group.nsfAmount || 0)).toFixed(2);
+                html += '</td></tr>';
+
+                for (var j = 0; j < group.invoices.length; j++) {
+                    var inv = group.invoices[j];
+                    var uniqueId = inv.id + '_' + group.id; // Unique ID pattern
+
+                    html += '<tr>';
+                    
+                    // Calculate available amounts FIRST (same logic as button disable)
+                    var appliedAmount = Math.abs(parseFloat(inv.appliedAmount));
+                    
+                    // Calculate total available on the source (source total - chargebacks already on source)
+                    var totalSourceAvailableForDispute = parseFloat(group.totalAmount) - (parseFloat(group.chargebackDisputeAmount) || 0);
+                    var totalSourceAvailableForFraud = parseFloat(group.totalAmount) - (parseFloat(group.chargebackFraudAmount) || 0);
+                    var totalSourceAvailableForNSF = parseFloat(group.totalAmount) - (parseFloat(group.nsfAmount) || 0);
+                    
+                    // Available for this invoice is the minimum of: invoice's applied amount OR what's left on the source
+                    var availableForDispute = Math.min(appliedAmount, Math.max(0, totalSourceAvailableForDispute));
+                    var availableForFraud = Math.min(appliedAmount, Math.max(0, totalSourceAvailableForFraud));
+                    var availableForNSF = Math.min(appliedAmount, Math.max(0, totalSourceAvailableForNSF));
+                    
+                    // Calculate minimum remaining - if ANY type is exhausted, the whole source is exhausted
+                    var minRemaining = Math.min(availableForDispute, availableForFraud, availableForNSF);
+                    var hasRemainingAmount = minRemaining > 0;
+                    
+                    log.debug('Checkbox Render Calculation', {
+                        invoiceId: inv.id,
+                        invoiceTranId: inv.tranid,
+                        sourceId: group.id,
+                        sourceTranId: group.tranid,
+                        appliedAmount: appliedAmount,
+                        sourceChargebackDispute: group.chargebackDisputeAmount,
+                        sourceChargebackFraud: group.chargebackFraudAmount,
+                        sourceNSF: group.nsfAmount,
+                        totalSourceAvailableForDispute: totalSourceAvailableForDispute,
+                        totalSourceAvailableForFraud: totalSourceAvailableForFraud,
+                        totalSourceAvailableForNSF: totalSourceAvailableForNSF,
+                        availableForDispute: availableForDispute,
+                        availableForFraud: availableForFraud,
+                        availableForNSF: availableForNSF,
+                        minRemaining: minRemaining,
+                        hasRemainingAmount: hasRemainingAmount,
+                        willRenderCheckbox: hasRemainingAmount
+                    });
+                    
+                    // Checkbox column - only render checkbox if remaining amount is > 0
+                    html += '<td class="invoice-checkbox" style="display: none; text-align: center;">';
+                    if (hasRemainingAmount) {
+                        html += '<input type="checkbox" id="checkbox-' + uniqueId + '" class="invoice-checkbox-input" ';
+                        html += 'onchange="toggleInvoiceSelection(\'' + uniqueId + '\', \'' + inv.id + '\', \'' + minRemaining + '\')" ';
+                        html += 'style="width: 18px; height: 18px; cursor: pointer;" />';
+                    }
+                    html += '</td>';
+
+                    // Action buttons
+                    html += '<td class="action-cell invoice-action-buttons">';
+                    
+                    // Calculate available amounts based on source chargeback amounts
+                    var appliedAmount = Math.abs(parseFloat(inv.appliedAmount));
+                    
+                    // Calculate total available on the source (source total - chargebacks already on source)
+                    var totalSourceAvailableForDispute = parseFloat(group.totalAmount) - (parseFloat(group.chargebackDisputeAmount) || 0);
+                    var totalSourceAvailableForFraud = parseFloat(group.totalAmount) - (parseFloat(group.chargebackFraudAmount) || 0);
+                    var totalSourceAvailableForNSF = parseFloat(group.totalAmount) - (parseFloat(group.nsfAmount) || 0);
+                    
+                    // Log calculation details
+                    log.debug('Button Disable Calculation', {
+                        invoiceId: inv.id,
+                        invoiceTranId: inv.tranid,
+                        sourceId: group.id,
+                        sourceTranId: group.tranid,
+                        sourceType: group.type,
+                        appliedAmount: appliedAmount,
+                        sourceTotalAmount: group.totalAmount,
+                        sourceDisputeChargebacks: group.chargebackDisputeAmount,
+                        sourceFraudChargebacks: group.chargebackFraudAmount,
+                        sourceNSF: group.nsfAmount,
+                        totalSourceAvailableForDispute: totalSourceAvailableForDispute,
+                        totalSourceAvailableForFraud: totalSourceAvailableForFraud,
+                        totalSourceAvailableForNSF: totalSourceAvailableForNSF
+                    });
+                    
+                    // Available for this invoice is the minimum of: invoice's applied amount OR what's left on the source
+                    var availableForDispute = Math.min(appliedAmount, Math.max(0, totalSourceAvailableForDispute));
+                    var availableForFraud = Math.min(appliedAmount, Math.max(0, totalSourceAvailableForFraud));
+                    var availableForNSF = Math.min(appliedAmount, Math.max(0, totalSourceAvailableForNSF));
+                    
+                    log.debug('Final Available Amounts', {
+                        invoiceId: inv.id,
+                        sourceId: group.id,
+                        availableForDispute: availableForDispute,
+                        availableForFraud: availableForFraud,
+                        availableForNSF: availableForNSF
+                    });
+                    
+                    // Calculate minimum remaining - if ANY type is exhausted, the whole source is exhausted
+                    var minRemaining = Math.min(availableForDispute, availableForFraud, availableForNSF);
+                    var allDisabled = minRemaining <= 0;
+                    
+                    var disputeDisabled = allDisabled || availableForDispute <= 0;
+                    var fraudDisabled = allDisabled || availableForFraud <= 0;
+                    var nsfDisabled = allDisabled || availableForNSF <= 0;
+                    
+                    var disputeClass = disputeDisabled ? ' disabled' : '';
+                    var fraudClass = fraudDisabled ? ' disabled' : '';
+                    var nsfClass = nsfDisabled ? ' disabled' : '';
+                    
+                    var disputeAttr = disputeDisabled ? ' disabled' : '';
+                    var fraudAttr = fraudDisabled ? ' disabled' : '';
+                    var nsfAttr = nsfDisabled ? ' disabled' : '';
+                    
+                    var absAppliedAmount = Math.abs(parseFloat(inv.appliedAmount));
+                    var remainingAmount = Math.min(availableForDispute, availableForFraud, availableForNSF);
+                    html += '<button type="button" class="action-btn chargeback-btn' + disputeClass + '"' + disputeAttr + ' onclick="processAction(\'' + uniqueId + '\', \'' + inv.id + '\', \'chargeback\', \'' + group.id + '\', \'' + group.type + '\', \'' + remainingAmount + '\')">Process Dispute Chargeback</button>';
+                    html += '<button type="button" class="action-btn fraud-btn' + fraudClass + '"' + fraudAttr + ' onclick="processAction(\'' + uniqueId + '\', \'' + inv.id + '\', \'fraud\', \'' + group.id + '\', \'' + group.type + '\', \'' + remainingAmount + '\')">Process Fraud Chargeback</button>';
+                    html += '<button type="button" class="action-btn nsf-btn' + nsfClass + '"' + nsfAttr + ' onclick="processAction(\'' + uniqueId + '\', \'' + inv.id + '\', \'nsf\', \'' + group.id + '\', \'' + group.type + '\', \'' + remainingAmount + '\')">Process NSF Check</button>';
+                    html += '</td>';
+
+                    // Invoice details
+                    html += '<td><a href="/app/accounting/transactions/custinvc.nl?id=' + inv.id + '" target="_blank">' + escapeHtml(inv.tranid) + '</a></td>';
+                    html += '<td>' + escapeHtml(inv.date) + '</td>';
+                    
+                    // Applied amount (with remaining display and edit link)
+                    html += '<td id="amount-cell-' + uniqueId + '">';
+                    var displayAmount = Math.abs(parseFloat(inv.appliedAmount));
+                    
+                    // Calculate the maximum remaining amount (most restrictive of the three types)
+                    var maxRemaining = Math.min(availableForDispute, availableForFraud, availableForNSF);
+                    
+                    log.debug('Display Amount Calculation', {
+                        invoiceId: inv.id,
+                        sourceId: group.id,
+                        displayAmount: displayAmount,
+                        maxRemaining: maxRemaining,
+                        availableForDispute: availableForDispute,
+                        availableForFraud: availableForFraud,
+                        availableForNSF: availableForNSF,
+                        willShowRemaining: maxRemaining < displayAmount
+                    });
+                    
+                    if (maxRemaining < displayAmount) {
+                        // Show crossed out original amount and remaining
+                        html += '<div style="text-decoration: line-through; color: #999; font-size: 12px;">$' + displayAmount.toFixed(2) + '</div>';
+                        html += '<div style="font-weight: bold; color: ' + (maxRemaining > 0 ? '#28a745' : '#dc3545') + ';">$' + maxRemaining.toFixed(2) + ' Remaining</div>';
+                    } else {
+                        // Show full amount available
+                        html += '<div style="font-weight: bold; color: #28a745;">$' + displayAmount.toFixed(2) + '</div>';
+                    }
+                    
+                    html += '<a href="javascript:void(0)" onclick="editPartialAmount(\'' + uniqueId + '\', \'' + inv.id + '\', \'' + maxRemaining + '\', \'' + inv.fullAmount + '\')\" ';
+                    html += 'style="font-size: 11px; color: #007bff; text-decoration: none; margin-top: 4px; display: inline-block;" ';
+                    html += 'title="Edit">✏️ Edit</a>';
+                    html += '</td>';
+
+                    // Full invoice amount (read-only)
+                    html += '<td style="font-weight: bold;">$' + parseFloat(inv.fullAmount).toFixed(2) + '</td>';
+
+                    // Application Trail breadcrumb
+                    html += '<td style="font-size: 11px; color: #666;">';
+                    if (inv.sourceDepositId && inv.sourceDepositTranId) {
+                        // CD -> DEPA -> INV trail
+                        html += '<a href="/app/accounting/transactions/custdep.nl?id=' + inv.sourceDepositId + '" target="_blank" style="color: #007bff;">' + escapeHtml(inv.sourceDepositTranId) + '</a>';
+                        html += ' → ';
+                        html += '<a href="/app/accounting/transactions/depappl.nl?id=' + inv.applicationId + '" target="_blank" style="color: #007bff;">' + escapeHtml(inv.applicationTranId) + '</a>';
+                        html += ' → ';
+                        html += '<a href="/app/accounting/transactions/custinvc.nl?id=' + inv.id + '" target="_blank" style="color: #007bff;">' + escapeHtml(inv.tranid) + '</a>';
+                    } else {
+                        // Direct application trail (Payment/CM/JE -> INV)
+                        var appUrl = '/app/accounting/transactions/transaction.nl?id=' + inv.applicationId;
+                        if (inv.applicationType && inv.applicationType.indexOf('Payment') !== -1) {
+                            appUrl = '/app/accounting/transactions/custpymt.nl?id=' + inv.applicationId;
+                        } else if (inv.applicationType && inv.applicationType.indexOf('Credit') !== -1) {
+                            appUrl = '/app/accounting/transactions/custcred.nl?id=' + inv.applicationId;
+                        }
+                        html += '<a href="' + appUrl + '" target="_blank" style="color: #007bff;">' + escapeHtml(inv.applicationTranId) + '</a>';
+                        html += ' → ';
+                        html += '<a href="/app/accounting/transactions/custinvc.nl?id=' + inv.id + '" target="_blank" style="color: #007bff;">' + escapeHtml(inv.tranid) + '</a>';
+                    }
+                    html += '</td>';
+
+                    html += '<td>' + escapeHtml(inv.memo) + '</td>';
+                    html += '</tr>';
+                }
+
+                html += '</tbody></table>';
+                html += '</div>'; // End group-content
+                html += '</div>'; // End payment-source-group
+            }
+
+            html += '</div>'; // End payment-source-groups
+
+            // Multi-select summary at bottom
+            html += '<div id="multi-select-summary" style="display: none; margin-top: 15px; padding: 15px; background-color: #f8f9fa; border: 2px solid #007bff; border-radius: 6px;">';
+            html += '<div id="running-total" style="font-size: 16px; margin-bottom: 15px;"><strong>Selected: 0 invoice(s) | Total: <span style="color: #28a745;">$0.00</span></strong></div>';
+            html += '<div style="display: flex; gap: 10px;">';
+            html += '<button type="button" class="action-btn chargeback-btn" style="font-size: 14px; padding: 10px 20px;" onclick="processMultipleInvoices(\'chargeback\')">Process All as Dispute Chargeback</button>';
+            html += '<button type="button" class="action-btn fraud-btn" style="font-size: 14px; padding: 10px 20px;" onclick="processMultipleInvoices(\'fraud\')">Process All as Fraud Chargeback</button>';
+            html += '<button type="button" class="action-btn nsf-btn" style="font-size: 14px; padding: 10px 20px;" onclick="processMultipleInvoices(\'nsf\')">Process All as NSF Check</button>';
+            html += '</div>';
+            html += '</div>';
+
+            return html;
         }
 
         /**
@@ -4661,6 +5089,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 var invoiceId = params.invoiceId;
                 var type = params.type;
                 var partialAmount = params.partialAmount; // NEW: Get partial amount if provided
+                var sourceId = params.sourceId; // NEW: Get source ID (CD or Payment ID)
+                var sourceType = params.sourceType; // NEW: Get source type
 
                 if (!action || !invoiceId || !type) {
                     throw new Error('Missing required parameters');
@@ -4670,10 +5100,12 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     action: action,
                     invoice: invoiceId,
                     type: type,
-                    partialAmount: partialAmount || 'Not specified (will use full amount)'
+                    partialAmount: partialAmount || 'Not specified (will use full amount)',
+                    sourceId: sourceId || 'Not specified (will search)',
+                    sourceType: sourceType || 'Not specified'
                 });
 
-                var result = processChargebackOrNsf(invoiceId, type, partialAmount); // NEW: Pass partial amount
+                var result = processChargebackOrNsf(invoiceId, type, partialAmount, sourceId, sourceType); // NEW: Pass source info
 
                 redirect.toSuitelet({
                     scriptId: runtime.getCurrentScript().id,
@@ -4716,11 +5148,13 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             var invoiceIds = params.invoiceIds;
             var type = params.type;
             var partialAmountsJson = params.partialAmounts;
+            var sourceMapJson = params.sourceMap; // NEW: Receive source mapping
 
             log.audit('Process Multiple Invoices Request', {
                 invoiceIds: invoiceIds,
                 type: type,
-                partialAmountsJson: partialAmountsJson
+                partialAmountsJson: partialAmountsJson,
+                sourceMapJson: sourceMapJson
             });
 
             try {
@@ -4730,6 +5164,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
                 var invoiceIdArray = invoiceIds.split(',');
                 var partialAmounts = {};
+                var sourceMap = {}; // NEW: Parse source map
 
                 if (partialAmountsJson) {
                     try {
@@ -4738,8 +5173,16 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         log.error('Error parsing partial amounts JSON', e.toString());
                     }
                 }
+                
+                if (sourceMapJson) {
+                    try {
+                        sourceMap = JSON.parse(sourceMapJson);
+                    } catch (e) {
+                        log.error('Error parsing source map JSON', e.toString());
+                    }
+                }
 
-                var result = processMultipleChargebackOrNsf(invoiceIdArray, type, partialAmounts);
+                var result = processMultipleChargebackOrNsf(invoiceIdArray, type, partialAmounts, sourceMap); // Pass sourceMap
 
                 redirect.toSuitelet({
                     scriptId: runtime.getCurrentScript().id,
@@ -5404,6 +5847,42 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 linkedSalesOrder: salesOrderId || 'None'
             });
 
+            // Update the deposit with chargeback amount
+            try {
+                var depositRecordForUpdate = record.load({
+                    type: record.Type.CUSTOMER_DEPOSIT,
+                    id: depositId
+                });
+
+                var fieldName = type === 'nsf' ? 'custbody_nsf_amount' :
+                    (type === 'fraud' ? 'custbody_chargeback_fraud_amount' : 'custbody_chargeback_amount_dispute');
+
+                var currentAmount = parseFloat(depositRecordForUpdate.getValue(fieldName)) || 0;
+                var newAmount = currentAmount + parseFloat(amountToRefund);
+
+                depositRecordForUpdate.setValue({
+                    fieldId: fieldName,
+                    value: newAmount
+                });
+
+                depositRecordForUpdate.save();
+
+                log.audit('Deposit Updated with Chargeback Amount', {
+                    depositId: depositId,
+                    fieldName: fieldName,
+                    previousAmount: currentAmount,
+                    chargebackAmount: amountToRefund,
+                    newTotal: newAmount
+                });
+            } catch (e) {
+                log.error('Error updating deposit chargeback amount', {
+                    error: e.toString(),
+                    stack: e.stack,
+                    depositId: depositId
+                });
+                // Don't fail the entire transaction - just log the error
+            }
+
             // Update Sales Order with appropriate checkbox if Sales Order exists
             if (salesOrderId) {
                 try {
@@ -5464,13 +5943,17 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
     * @param {string} invoiceId - Internal ID of the original invoice
     * @param {string} type - 'chargeback', 'fraud', or 'nsf'
     * @param {string} partialAmount - Optional partial amount (if not provided, uses full invoice amount)
+    * @param {string} sourceId - Optional source CD/Payment ID (if not provided, will search)
+    * @param {string} sourceType - Optional source record type (Customer Deposit or Customer Payment)
     * @returns {Object} Object containing created record IDs and customer name
     */
-        function processChargebackOrNsf(invoiceId, type, partialAmount) {
+        function processChargebackOrNsf(invoiceId, type, partialAmount, sourceId, sourceType) {
             log.audit('Process Start', {
                 invoiceId: invoiceId,
                 type: type,
-                partialAmount: partialAmount || 'Not specified'
+                partialAmount: partialAmount || 'Not specified',
+                sourceId: sourceId || 'Not specified (will search)',
+                sourceType: sourceType || 'Not specified'
             });
 
             var itemId;
@@ -5509,7 +5992,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             var isPartial = false;
 
             if (partialAmount && partialAmount.trim() !== '') {
-                amountToProcess = parseFloat(partialAmount);
+                amountToProcess = Math.abs(parseFloat(partialAmount));
 
                 // Validate partial amount
                 if (isNaN(amountToProcess) || amountToProcess <= 0) {
@@ -5837,6 +6320,102 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 });
             }
 
+            // Update the source Customer Deposit or Payment with chargeback amount
+            try {
+                var finalSourceId = sourceId; // Use provided sourceId if available
+                var finalSourceType = sourceType; // Use provided sourceType if available
+
+                // If source not provided, search for it
+                if (!finalSourceId || !finalSourceType) {
+                    log.debug('Source not provided - searching for source transaction');
+
+                    // Find the source transaction that paid this invoice
+                    var sourceSearch = search.create({
+                        type: search.Type.TRANSACTION,
+                        filters: [
+                            ['appliedtotransaction.internalid', 'anyof', invoiceId],
+                            'AND',
+                            ['mainline', 'is', 'T']
+                        ],
+                        columns: [
+                            search.createColumn({ name: 'internalid' }),
+                            search.createColumn({ name: 'type' }),
+                            search.createColumn({ name: 'createdfrom' })
+                        ]
+                    });
+
+                    sourceSearch.run().each(function(result) {
+                        var tranType = result.getValue('type');
+
+                        // If it's a DEPA, get the Customer Deposit from createdfrom
+                        if (tranType === 'DepAppl') {
+                            var depositId = result.getValue('createdfrom');
+                            if (depositId) {
+                                finalSourceId = depositId;
+                                finalSourceType = record.Type.CUSTOMER_DEPOSIT;
+                                return false; // Stop - found it
+                            }
+                        }
+                        // If it's a direct Payment
+                        else if (tranType === 'CustPymt') {
+                            finalSourceId = result.id;
+                            finalSourceType = record.Type.CUSTOMER_PAYMENT;
+                            return false; // Stop - found it
+                        }
+
+                        return true;
+                    });
+                } else {
+                    log.debug('Using provided source', {
+                        sourceId: finalSourceId,
+                        sourceType: finalSourceType
+                    });
+
+                    // Convert sourceType string to proper record type constant
+                    if (finalSourceType === 'Customer Deposit') {
+                        finalSourceType = record.Type.CUSTOMER_DEPOSIT;
+                    } else if (finalSourceType === 'Customer Payment') {
+                        finalSourceType = record.Type.CUSTOMER_PAYMENT;
+                    }
+                }
+
+                if (finalSourceId && finalSourceType) {
+                    var sourceRecord = record.load({
+                        type: finalSourceType,
+                        id: finalSourceId
+                    });
+
+                    var fieldName = type === 'nsf' ? 'custbody_nsf_amount' :
+                        (type === 'fraud' ? 'custbody_chargeback_fraud_amount' : 'custbody_chargeback_amount_dispute');
+
+                    var currentAmount = parseFloat(sourceRecord.getValue(fieldName)) || 0;
+                    var newAmount = currentAmount + parseFloat(amountToProcess);
+
+                    sourceRecord.setValue({
+                        fieldId: fieldName,
+                        value: newAmount
+                    });
+
+                    sourceRecord.save();
+
+                    log.audit('Source Transaction Updated with Chargeback Amount', {
+                        sourceId: finalSourceId,
+                        sourceType: finalSourceType,
+                        fieldName: fieldName,
+                        previousAmount: currentAmount,
+                        chargebackAmount: amountToProcess,
+                        newTotal: newAmount
+                    });
+                }
+            } catch (e) {
+                log.error('Error updating source transaction chargeback amount', {
+                    error: e.toString(),
+                    stack: e.stack,
+                    invoiceId: invoiceId
+                });
+                // Don't fail the whole process - just log the error
+            }
+
             return {
                 creditMemoId: creditMemoId,
                 creditMemoTranId: creditMemoTranId,
@@ -5856,12 +6435,13 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
     * @param {Object} partialAmounts - Object mapping invoice IDs to partial amounts
     * @returns {Object} Result with created record details
     */
-        function processMultipleChargebackOrNsf(invoiceIds, type, partialAmounts) {
+        function processMultipleChargebackOrNsf(invoiceIds, type, partialAmounts, sourceMap) {
             log.audit('Process Multiple Invoices - START', {
                 invoiceIds: invoiceIds,
                 type: type,
                 count: invoiceIds.length,
-                hasPartialAmounts: Object.keys(partialAmounts || {}).length > 0
+                hasPartialAmounts: Object.keys(partialAmounts || {}).length > 0,
+                hasSourceMap: Object.keys(sourceMap || {}).length > 0
             });
 
             if (!invoiceIds || invoiceIds.length === 0) {
@@ -6244,6 +6824,176 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 }
             }
 
+            // Update source Customer Deposits or Payments with chargeback amounts
+            try {
+                // Map to accumulate chargeback amounts by source ID
+                var sourceAmounts = {}; // sourceId -> { sourceType, amount }
+
+                // If we have sourceMap, use it directly (supports same invoice from multiple sources)
+                if (sourceMap && Object.keys(sourceMap).length > 0) {
+                    log.debug('Using SourceMap for source identification', 'SourceMap entries: ' + Object.keys(sourceMap).length);
+                    
+                    for (var uniqueId in sourceMap) {
+                        if (sourceMap.hasOwnProperty(uniqueId)) {
+                            var entry = sourceMap[uniqueId];
+                            var sourceId = entry.sourceId;
+                            var invId = entry.invoiceId;
+                            var chargebackAmount = entry.amount;
+                            
+                            if (sourceId) {
+                                // Determine sourceType by looking up the transaction
+                                var typeSearch = search.lookupFields({
+                                    type: search.Type.TRANSACTION,
+                                    id: sourceId,
+                                    columns: ['type']
+                                });
+                                var tranType = typeSearch.type[0].value;
+                                var sourceType = (tranType === 'CustDep') ? record.Type.CUSTOMER_DEPOSIT : record.Type.CUSTOMER_PAYMENT;
+                                
+                                // Accumulate amount for this source
+                                if (!sourceAmounts[sourceId]) {
+                                    sourceAmounts[sourceId] = {
+                                        sourceType: sourceType,
+                                        amount: 0
+                                    };
+                                }
+                                sourceAmounts[sourceId].amount += chargebackAmount;
+                                
+                                log.debug('Source from SourceMap', {
+                                    uniqueId: uniqueId,
+                                    invoiceId: invId,
+                                    sourceId: sourceId,
+                                    sourceType: sourceType,
+                                    chargebackAmount: chargebackAmount,
+                                    accumulatedForSource: sourceAmounts[sourceId].amount
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    // Fallback: Search for sources (backward compatibility or when sourceMap not provided)
+                    log.debug('SourceMap not provided, searching for sources', 'Invoice count: ' + invoiceIds.length);
+                    
+                    for (var i = 0; i < invoiceIds.length; i++) {
+                        var invId = invoiceIds[i];
+                        var currentInvoice = invoiceBreakdown[i];
+                        var chargebackAmount = currentInvoice.amount;
+
+                        var sourceId = null;
+                        var sourceType = null;
+                        
+                        // Find the source transaction that paid this invoice
+                        var sourceSearch = search.create({
+                            type: search.Type.TRANSACTION,
+                            filters: [
+                                ['appliedtotransaction.internalid', 'anyof', invId],
+                                'AND',
+                                ['mainline', 'is', 'T']
+                            ],
+                            columns: [
+                                search.createColumn({ name: 'internalid' }),
+                                search.createColumn({ name: 'type' }),
+                                search.createColumn({ name: 'createdfrom' })
+                            ]
+                        });
+
+                        sourceSearch.run().each(function(result) {
+                            var tranType = result.getValue('type');
+
+                            // If it's a DEPA, get the Customer Deposit from createdfrom
+                            if (tranType === 'DepAppl') {
+                                var depositId = result.getValue('createdfrom');
+                                if (depositId) {
+                                    sourceId = depositId;
+                                    sourceType = record.Type.CUSTOMER_DEPOSIT;
+                                    return false; // Stop - found it
+                                }
+                            }
+                            // If it's a direct Payment
+                            else if (tranType === 'CustPymt') {
+                                sourceId = result.id;
+                                sourceType = record.Type.CUSTOMER_PAYMENT;
+                                return false; // Stop - found it
+                            }
+
+                            return true;
+                        });
+
+                        // Accumulate amount for this source
+                        if (sourceId && sourceType) {
+                            if (!sourceAmounts[sourceId]) {
+                                sourceAmounts[sourceId] = {
+                                    sourceType: sourceType,
+                                    amount: 0
+                                };
+                            }
+                            sourceAmounts[sourceId].amount += chargebackAmount;
+
+                            log.debug('Source from Search', {
+                                invoiceId: invId,
+                                invoiceTranId: currentInvoice.tranid,
+                                sourceId: sourceId,
+                                sourceType: sourceType,
+                                chargebackAmount: chargebackAmount,
+                                accumulatedForSource: sourceAmounts[sourceId].amount
+                            });
+                        }
+                    }
+                }
+
+                // Update each unique source with its accumulated chargeback amount
+                var fieldName = type === 'nsf' ? 'custbody_nsf_amount' :
+                    (type === 'fraud' ? 'custbody_chargeback_fraud_amount' : 'custbody_chargeback_amount_dispute');
+
+                for (var sourceId in sourceAmounts) {
+                    if (sourceAmounts.hasOwnProperty(sourceId)) {
+                        var sourceInfo = sourceAmounts[sourceId];
+
+                        try {
+                            var sourceRecord = record.load({
+                                type: sourceInfo.sourceType,
+                                id: sourceId
+                            });
+
+                            var currentAmount = parseFloat(sourceRecord.getValue(fieldName)) || 0;
+                            var newAmount = currentAmount + sourceInfo.amount;
+
+                            sourceRecord.setValue({
+                                fieldId: fieldName,
+                                value: newAmount
+                            });
+
+                            sourceRecord.save();
+
+                            log.audit('Source Transaction Updated with Chargeback Amount', {
+                                sourceId: sourceId,
+                                sourceType: sourceInfo.sourceType,
+                                fieldName: fieldName,
+                                previousAmount: currentAmount,
+                                chargebackAmount: sourceInfo.amount,
+                                newTotal: newAmount,
+                                fromInvoiceCount: invoiceIds.length
+                            });
+                        } catch (sourceUpdateError) {
+                            log.error('Error updating individual source transaction', {
+                                error: sourceUpdateError.toString(),
+                                stack: sourceUpdateError.stack,
+                                sourceId: sourceId,
+                                sourceType: sourceInfo.sourceType
+                            });
+                            // Continue with other sources
+                        }
+                    }
+                }
+            } catch (e) {
+                log.error('Error updating source transactions with chargeback amounts', {
+                    error: e.toString(),
+                    stack: e.stack,
+                    invoiceIds: invoiceIds
+                });
+                // Don't fail the whole process - just log the error
+            }
+
             log.audit('Process Multiple Invoices - COMPLETE', {
                 invoiceCount: invoiceIds.length,
                 totalAmount: totalAmount,
@@ -6388,7 +7138,19 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '.search-result-item:hover { background-color: #f0f0f0; }' +
                 '.upload-message { margin-top: 15px; padding: 10px; border-radius: 4px; display: none; }' +
                 '.upload-message.success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; display: block; }' +
-                '.upload-message.error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; display: block; }';
+                '.upload-message.error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; display: block; }' +
+                // NEW: Payment source group styles - softer blue matching dispute form
+                '.payment-source-groups { margin: 15px 0; }' +
+                '.payment-source-group { margin-bottom: 20px; border: 1px solid #2196F3; border-radius: 6px; overflow: hidden; background: white; }' +
+                '.group-header { background-color: #e7f3ff; color: #333; padding: 12px 15px; cursor: pointer; font-size: 14px; display: flex; align-items: center; transition: background 0.3s; user-select: none; border-bottom: 2px solid #2196F3; }' +
+                '.group-header:hover { background-color: #d0e9ff; }' +
+                '.group-header .expand-icon { display: inline-block; margin-right: 8px; transition: transform 0.3s; font-size: 12px; color: #2196F3; }' +
+                '.group-header.collapsed .expand-icon { transform: rotate(-90deg); }' +
+                '.group-header a { color: #007bff; text-decoration: underline; }' +
+                '.group-header a:hover { color: #0056b3; }' +
+                '.group-content { padding: 0; transition: max-height 0.3s ease-out; max-height: 5000px; overflow: visible; }' +
+                '.group-content.collapsed { max-height: 0; overflow: hidden; }' +
+                '.group-content table { margin: 0; border-top: none; }';
         }
 
         /**
@@ -6528,49 +7290,64 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    }' +
                 '    updateRunningTotal();' +
                 '}' +
-                // NEW: Toggle individual invoice selection
-                'function toggleInvoiceSelection(invoiceId, originalAmount) {' +
-                '    var checkbox = document.getElementById("checkbox-" + invoiceId);' +
+                // UPDATED: Toggle individual invoice selection with unique ID support and remaining amounts
+                'function toggleInvoiceSelection(uniqueId, invoiceId, remainingAmount) {' +
+                '    var checkbox = document.getElementById("checkbox-" + uniqueId);' +
                 '    if (checkbox.checked) {' +
-                '        var amountToUse = partialAmounts[invoiceId] || originalAmount;' +
-                '        selectedInvoices[invoiceId] = parseFloat(amountToUse);' +
+                '        var amountToUse = partialAmounts[uniqueId] || Math.abs(parseFloat(remainingAmount));' +
+                '        var parts = uniqueId.split("_");' +
+                '        var sourceId = parts.length > 1 ? parts[1] : null;' +
+                '        selectedInvoices[uniqueId] = { invoiceId: invoiceId, amount: Math.abs(parseFloat(amountToUse)), sourceId: sourceId };' +
                 '    } else {' +
-                '        delete selectedInvoices[invoiceId];' +
+                '        delete selectedInvoices[uniqueId];' +
                 '    }' +
                 '    updateRunningTotal();' +
                 '}' +
-                // NEW: Update running total display
+                // UPDATED: Update running total display with unique ID support and positive amounts
                 'function updateRunningTotal() {' +
                 '    var totalElement = document.getElementById("running-total");' +
                 '    if (!totalElement) return;' +
                 '    var total = 0;' +
-                '    for (var invoiceId in selectedInvoices) {' +
-                '        if (selectedInvoices.hasOwnProperty(invoiceId)) {' +
-                '            total += selectedInvoices[invoiceId];' +
+                '    for (var uniqueId in selectedInvoices) {' +
+                '        if (selectedInvoices.hasOwnProperty(uniqueId)) {' +
+                '            total += Math.abs(parseFloat(selectedInvoices[uniqueId].amount));' +
                 '        }' +
                 '    }' +
                 '    var count = Object.keys(selectedInvoices).length;' +
                 '    totalElement.innerHTML = "<strong>Selected: " + count + " invoice(s) | Total: <span style=\\"color: #28a745;\\">$" + total.toFixed(2) + "</span></strong>";' +
                 '}' +
-                // NEW: Process multiple invoices
+                // UPDATED: Process multiple invoices with combined amounts for same invoice from different sources
                 'function processMultipleInvoices(type) {' +
-                '    var invoiceIds = Object.keys(selectedInvoices);' +
-                '    if (invoiceIds.length === 0) {' +
+                '    var uniqueIds = Object.keys(selectedInvoices);' +
+                '    if (uniqueIds.length === 0) {' +
                 '        alert("Please select at least one invoice");' +
                 '        return;' +
                 '    }' +
                 '    var typeText = type === "nsf" ? "NSF Check" : (type === "fraud" ? "Fraud Chargeback" : "Dispute Chargeback");' +
                 '    var total = 0;' +
-                '    for (var i = 0; i < invoiceIds.length; i++) {' +
-                '        total += selectedInvoices[invoiceIds[i]];' +
+                '    var invoiceAmountMap = {};' +
+                '    for (var i = 0; i < uniqueIds.length; i++) {' +
+                '        var uniqueId = uniqueIds[i];' +
+                '        var invoiceId = selectedInvoices[uniqueId].invoiceId;' +
+                '        var amount = Math.abs(parseFloat(selectedInvoices[uniqueId].amount));' +
+                '        total += amount;' +
+                '        if (!invoiceAmountMap[invoiceId]) {' +
+                '            invoiceAmountMap[invoiceId] = 0;' +
+                '        }' +
+                '        invoiceAmountMap[invoiceId] += amount;' +
                 '    }' +
-                '    var confirmMsg = "Process " + typeText + " for " + invoiceIds.length + " invoice(s)?\\n\\n";' +
+                '    var actualInvoiceIds = Object.keys(invoiceAmountMap);' +
+                '    var confirmMsg = "Process " + typeText + " for " + actualInvoiceIds.length + " invoice(s)?\\n\\n";' +
                 '    confirmMsg += "Total Amount: $" + total.toFixed(2) + "\\n\\n";' +
+                '    if (actualInvoiceIds.length < uniqueIds.length) {' +
+                '        confirmMsg += "Note: You selected the same invoice from multiple payment sources.\\n";' +
+                '        confirmMsg += "Amounts will be combined per invoice.\\n\\n";' +
+                '    }' +
                 '    confirmMsg += "This will create ONE combined transaction for all selected invoices.";' +
                 '    if (!confirm(confirmMsg)) {' +
                 '        return;' +
                 '    }' +
-                '    showLoading("Processing " + typeText + " for " + invoiceIds.length + " invoices...");' +
+                '    showLoading("Processing " + typeText + " for " + actualInvoiceIds.length + " invoices...");' +
                 '    var form = document.createElement("form");' +
                 '    form.method = "POST";' +
                 '    form.action = "' + scriptUrl + '";' +
@@ -6587,14 +7364,20 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    var idsInput = document.createElement("input");' +
                 '    idsInput.type = "hidden";' +
                 '    idsInput.name = "invoiceIds";' +
-                '    idsInput.value = invoiceIds.join(",");' +
+                '    idsInput.value = actualInvoiceIds.join(",");' +
                 '    form.appendChild(idsInput);' +
-                '    var amountsJson = JSON.stringify(partialAmounts);' +
+                '    var amountsJson = JSON.stringify(invoiceAmountMap);' +
                 '    var amountsInput = document.createElement("input");' +
                 '    amountsInput.type = "hidden";' +
                 '    amountsInput.name = "partialAmounts";' +
                 '    amountsInput.value = amountsJson;' +
                 '    form.appendChild(amountsInput);' +
+                '    var sourceMapJson = JSON.stringify(selectedInvoices);' +
+                '    var sourceMapInput = document.createElement("input");' +
+                '    sourceMapInput.type = "hidden";' +
+                '    sourceMapInput.name = "sourceMap";' +
+                '    sourceMapInput.value = sourceMapJson;' +
+                '    form.appendChild(sourceMapInput);' +
                 '    document.body.appendChild(form);' +
                 '    form.submit();' +
                 '}' +
@@ -7112,6 +7895,200 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '            document.getElementById("invoiceResults").innerHTML = "<div class=\\"error-msg\\">Error loading transactions: " + error + "</div>";' +
                 '        });' +
                 '}' +
+                // NEW: Client-side groupInvoicesByPaymentSource function
+                'function groupInvoicesByPaymentSource(invoices) {' +
+                '    console.log("Grouping invoices by payment source", invoices.length);' +
+                '    var sourceMap = {};' +
+                '    for (var i = 0; i < invoices.length; i++) {' +
+                '        var invoice = invoices[i];' +
+                '        var applications = invoice.paymentApplications || [];' +
+                '        for (var j = 0; j < applications.length; j++) {' +
+                '            var app = applications[j];' +
+                '            var sourceId, sourceTranId, sourceType, sourceDate, sourceAmount;' +
+                '            if (app.sourceDeposit && app.sourceDeposit.id && app.sourceDeposit.tranid) {' +
+                '                sourceId = app.sourceDeposit.id;' +
+                '                sourceTranId = app.sourceDeposit.tranid;' +
+                '                sourceType = "Customer Deposit";' +
+                '                sourceDate = app.sourceDeposit.date;' +
+                '                sourceAmount = app.sourceDeposit.amount;' +
+                '            } else {' +
+                '                if (app.type && app.type.indexOf("Payment") !== -1) {' +
+                '                    sourceId = app.id;' +
+                '                    sourceTranId = app.tranid;' +
+                '                    sourceType = "Customer Payment";' +
+                '                    sourceDate = app.date;' +
+                '                    sourceAmount = app.amount;' +
+                '                } else {' +
+                '                    continue;' +
+                '                }' +
+                '            }' +
+                '            if (!sourceMap[sourceId]) {' +
+                '                sourceMap[sourceId] = {' +
+                '                    id: sourceId,' +
+                '                    tranid: sourceTranId,' +
+                '                    type: sourceType,' +
+                '                    date: sourceDate,' +
+                '                    totalAmount: sourceAmount,' +
+                '                    chargebackDisputeAmount: invoice.chargebackDisputeAmount || 0,' +
+                '                    chargebackFraudAmount: invoice.chargebackFraudAmount || 0,' +
+                '                    nsfAmount: invoice.nsfAmount || 0,' +
+                '                    invoices: []' +
+                '                };' +
+                '            }' +
+                '            sourceMap[sourceId].invoices.push({' +
+                '                id: invoice.id,' +
+                '                tranid: invoice.tranid,' +
+                '                date: invoice.date,' +
+                '                fullAmount: invoice.amount,' +
+                '                appliedAmount: app.amount,' +
+                '                memo: invoice.memo || "",' +
+                '                hasDisputeChargeback: invoice.hasDisputeChargeback,' +
+                '                hasFraudChargeback: invoice.hasFraudChargeback,' +
+                '                applicationId: app.id,' +
+                '                applicationTranId: app.tranid,' +
+                '                applicationType: sourceType,' +
+                '                sourceDepositId: app.sourceDeposit ? app.sourceDeposit.id : null,' +
+                '                sourceDepositTranId: app.sourceDeposit ? app.sourceDeposit.tranid : null' +
+                '            });' +
+                '        }' +
+                '    }' +
+                '    var results = [];' +
+                '    for (var sourceId in sourceMap) {' +
+                '        if (sourceMap.hasOwnProperty(sourceId)) {' +
+                '            results.push(sourceMap[sourceId]);' +
+                '        }' +
+                '    }' +
+                '    results.sort(function(a, b) {' +
+                '        return new Date(b.date) - new Date(a.date);' +
+                '    });' +
+                '    console.log("Payment source groups created:", results.length);' +
+                '    return results;' +
+                '}' +
+                // NEW: Client-side buildPaymentSourceGroupsTable function
+                'function buildPaymentSourceGroupsTable(paymentGroups) {' +
+                '    var html = "";' +
+                '    html += "<div class=\\"toggle-container\\">";' +
+                '    html += "<label class=\\"toggle-switch\\">";' +
+                '    html += "<input type=\\"checkbox\\" id=\\"multi-select-checkbox\\" onchange=\\"toggleMultiSelect()\\">";' +
+                '    html += "<span class=\\"toggle-slider\\"></span>";' +
+                '    html += "</label>";' +
+                '    html += "<label for=\\"multi-select-checkbox\\" class=\\"toggle-label\\">Select Multiple Invoices</label>";' +
+                '    html += "</div>";' +
+                '    html += "<div class=\\"payment-source-groups\\">";' +
+                '    for (var i = 0; i < paymentGroups.length; i++) {' +
+                '        var group = paymentGroups[i];' +
+                '        var groupId = "group-" + group.id;' +
+                '        html += "<div class=\\"payment-source-group\\">";' +
+                '        html += "<div class=\\"group-header\\" onclick=\\"toggleGroup(\\\'" + groupId + "\\\')\\\">";' +
+                '        html += "<span class=\\"expand-icon\\\">\u25bc</span> ";' +
+                '        html += "<strong>" + escapeHtmlClient(group.type) + "&nbsp;</strong> ";' +
+                '        html += "<a href=\\"/app/accounting/transactions/transaction.nl?id=" + group.id + "\\" target=\\"_blank\\" onclick=\\"event.stopPropagation()\\">" + escapeHtmlClient(group.tranid) + "</a> ";' +
+                '        html += "| Date: " + escapeHtmlClient(group.date) + " ";' +
+                '        html += "| Total: $" + parseFloat(group.totalAmount).toFixed(2) + " ";' +
+                '        html += "| Invoices: " + group.invoices.length;' +
+                '        html += "</div>";' +
+                '        html += "<div class=\\"group-content\\" id=\\"" + groupId + "\\">";' +
+                '        html += "<table class=\\"search-table\\">";' +
+                '        html += "<thead><tr>";' +
+                '        html += "<th class=\\"invoice-checkbox\\" style=\\"display: none; width: 40px;\\"></th>";' +
+                '        html += "<th>Action</th>";' +
+                '        html += "<th>Invoice #</th>";' +
+                '        html += "<th>Date</th>";' +
+                '        html += "<th>Applied Amount</th>";' +
+                '        html += "<th>Full Invoice Amount</th>";' +
+                '        html += "<th>Application Trail</th>";' +
+                '        html += "<th>Memo</th>";' +
+                '        html += "</tr></thead><tbody>";' +
+                '        for (var j = 0; j < group.invoices.length; j++) {' +
+                '            var inv = group.invoices[j];' +
+                '            var uniqueId = inv.id + "_" + group.id;' +
+                '            html += "<tr>";' +
+                '            var appliedAmount = Math.abs(parseFloat(inv.appliedAmount));' +
+                '            var totalSourceAvailableForDispute = parseFloat(group.totalAmount) - (parseFloat(group.chargebackDisputeAmount) || 0);' +
+                '            var totalSourceAvailableForFraud = parseFloat(group.totalAmount) - (parseFloat(group.chargebackFraudAmount) || 0);' +
+                '            var totalSourceAvailableForNSF = parseFloat(group.totalAmount) - (parseFloat(group.nsfAmount) || 0);' +
+                '            var availableForDispute = Math.min(appliedAmount, Math.max(0, totalSourceAvailableForDispute));' +
+                '            var availableForFraud = Math.min(appliedAmount, Math.max(0, totalSourceAvailableForFraud));' +
+                '            var availableForNSF = Math.min(appliedAmount, Math.max(0, totalSourceAvailableForNSF));' +
+                '            var minRemaining = Math.min(availableForDispute, availableForFraud, availableForNSF);' +
+                '            var hasRemainingAmount = minRemaining > 0;' +
+                '            html += "<td class=\\"invoice-checkbox\\" style=\\"display: none; text-align: center;\\">";' +
+                '            if (hasRemainingAmount) {' +
+                '                html += "<input type=\\"checkbox\\" id=\\"checkbox-" + uniqueId + "\\" class=\\"invoice-checkbox-input\\" ";' +
+                '                html += "onchange=\\"toggleInvoiceSelection(\'" + uniqueId + "\', \'" + inv.id + "\', \'" + minRemaining + "\')\\" ";' +
+                '                html += "style=\\"width: 18px; height: 18px; cursor: pointer;\\" />";' +
+                '            }' +
+                '            html += "</td>";' +
+                '            html += "<td class=\\"action-cell invoice-action-buttons\\">";' +
+                '            var allDisabled = minRemaining <= 0;' +
+                '            var disputeDisabled = allDisabled || availableForDispute <= 0;' +
+                '            var fraudDisabled = allDisabled || availableForFraud <= 0;' +
+                '            var nsfDisabled = allDisabled || availableForNSF <= 0;' +
+                '            var disputeClass = disputeDisabled ? " disabled" : "";' +
+                '            var fraudClass = fraudDisabled ? " disabled" : "";' +
+                '            var nsfClass = nsfDisabled ? " disabled" : "";' +
+                '            var disputeAttr = disputeDisabled ? " disabled" : "";' +
+                '            var fraudAttr = fraudDisabled ? " disabled" : "";' +
+                '            var nsfAttr = nsfDisabled ? " disabled" : "";' +
+                '            var absAppliedAmount = Math.abs(parseFloat(inv.appliedAmount));' +
+                '            var remainingAmount = Math.min(availableForDispute, availableForFraud, availableForNSF);' +
+                '            html += "<button type=\\"button\\" class=\\"action-btn chargeback-btn" + disputeClass + "\\"" + disputeAttr + " onclick=\\"processAction(\'" + uniqueId + "\', \'" + inv.id + "\', \'chargeback\', \'" + group.id + "\', \'" + group.type + "\', \'" + remainingAmount + "\')\\\">Process Dispute Chargeback</button>";' +
+                '            html += "<button type=\\"button\\" class=\\"action-btn fraud-btn" + fraudClass + "\\"" + fraudAttr + " onclick=\\"processAction(\'" + uniqueId + "\', \'" + inv.id + "\', \'fraud\', \'" + group.id + "\', \'" + group.type + "\', \'" + remainingAmount + "\')\\\">Process Fraud Chargeback</button>";' +
+                '            html += "<button type=\\"button\\" class=\\"action-btn nsf-btn" + nsfClass + "\\"" + nsfAttr + " onclick=\\"processAction(\'" + uniqueId + "\', \'" + inv.id + "\', \'nsf\', \'" + group.id + "\', \'" + group.type + "\', \'" + remainingAmount + "\')\\\">Process NSF Check</button>";' +
+                '            html += "</td>";' +
+                '            html += "<td><a href=\\"/app/accounting/transactions/custinvc.nl?id=" + inv.id + "\\" target=\\"_blank\\">" + escapeHtmlClient(inv.tranid) + "</a></td>";' +
+                '            html += "<td>" + escapeHtmlClient(inv.date) + "</td>";' +
+                '            html += "<td id=\\"amount-cell-" + uniqueId + "\\">";' +
+                '            var displayAmount = Math.abs(parseFloat(inv.appliedAmount));' +
+                '            var maxRemaining = Math.min(availableForDispute, availableForFraud, availableForNSF);' +
+                '            if (maxRemaining < displayAmount) {' +
+                '                html += "<div style=\\"text-decoration: line-through; color: #999; font-size: 12px;\\">$" + displayAmount.toFixed(2) + "</div>";' +
+                '                html += "<div style=\\"font-weight: bold; color: " + (maxRemaining > 0 ? "#28a745" : "#dc3545") + ";\\">$" + maxRemaining.toFixed(2) + " Remaining</div>";' +
+                '            } else {' +
+                '                html += "<div style=\\"font-weight: bold; color: #28a745;\\">$" + displayAmount.toFixed(2) + "</div>";' +
+                '            }' +
+                '            html += "<a href=\\"javascript:void(0)\\" onclick=\\"editPartialAmount(\'" + uniqueId + "\', \'" + inv.id + "\', \'" + maxRemaining + "\', \'" + inv.fullAmount + "\')\\" ";' +
+                '            html += "style=\\"font-size: 11px; color: #007bff; text-decoration: none; margin-top: 4px; display: inline-block;\\" ";' +
+                '            html += "title=\\"Edit\\">✏️ Edit</a>";' +
+                '            html += "</td>";' +
+                '            html += "<td style=\\"font-weight: bold;\\">$" + parseFloat(inv.fullAmount).toFixed(2) + "</td>";' +
+                '            html += "<td style=\\"font-size: 11px; color: #666;\\">";' +
+                '            if (inv.sourceDepositId && inv.sourceDepositTranId) {' +
+                '                html += "<a href=\\"/app/accounting/transactions/custdep.nl?id=" + inv.sourceDepositId + "\\" target=\\"_blank\\" style=\\"color: #007bff;\\">" + escapeHtmlClient(inv.sourceDepositTranId) + "</a>";' +
+                '                html += " → ";' +
+                '                html += "<a href=\\"/app/accounting/transactions/depappl.nl?id=" + inv.applicationId + "\\" target=\\"_blank\\" style=\\"color: #007bff;\\">" + escapeHtmlClient(inv.applicationTranId) + "</a>";' +
+                '                html += " → ";' +
+                '                html += "<a href=\\"/app/accounting/transactions/custinvc.nl?id=" + inv.id + "\\" target=\\"_blank\\" style=\\"color: #007bff;\\">" + escapeHtmlClient(inv.tranid) + "</a>";' +
+                '            } else {' +
+                '                var appUrl = "/app/accounting/transactions/transaction.nl?id=" + inv.applicationId;' +
+                '                if (inv.applicationType && inv.applicationType.indexOf("Payment") !== -1) {' +
+                '                    appUrl = "/app/accounting/transactions/custpymt.nl?id=" + inv.applicationId;' +
+                '                } else if (inv.applicationType && inv.applicationType.indexOf("Credit") !== -1) {' +
+                '                    appUrl = "/app/accounting/transactions/custcred.nl?id=" + inv.applicationId;' +
+                '                }' +
+                '                html += "<a href=\\"" + appUrl + "\\" target=\\"_blank\\" style=\\"color: #007bff;\\">" + escapeHtmlClient(inv.applicationTranId) + "</a>";' +
+                '                html += " → ";' +
+                '                html += "<a href=\\"/app/accounting/transactions/custinvc.nl?id=" + inv.id + "\\" target=\\"_blank\\" style=\\"color: #007bff;\\">" + escapeHtmlClient(inv.tranid) + "</a>";' +
+                '            }' +
+                '            html += "</td>";' +
+                '            html += "<td>" + escapeHtmlClient(inv.memo) + "</td>";' +
+                '            html += "</tr>";' +
+                '        }' +
+                '        html += "</tbody></table>";' +
+                '        html += "</div>";' +
+                '        html += "</div>";' +
+                '    }' +
+                '    html += "</div>";' +
+                '    html += "<div id=\\"multi-select-summary\\" style=\\"display: none; margin-top: 15px; padding: 15px; background-color: #f8f9fa; border: 2px solid #007bff; border-radius: 6px;\\">";' +
+                '    html += "<div id=\\"running-total\\" style=\\"font-size: 16px; margin-bottom: 15px;\\"><strong>Selected: 0 invoice(s) | Total: <span style=\\"color: #28a745;\\">$0.00</span></strong></div>";' +
+                '    html += "<div style=\\"display: flex; gap: 10px;\\">";' +
+                '    html += "<button type=\\"button\\" class=\\"action-btn chargeback-btn\\" style=\\"font-size: 14px; padding: 10px 20px;\\" onclick=\\"processMultipleInvoices(\'chargeback\')\\\">Process All as Dispute Chargeback</button>";' +
+                '    html += "<button type=\\"button\\" class=\\"action-btn fraud-btn\\" style=\\"font-size: 14px; padding: 10px 20px;\\" onclick=\\"processMultipleInvoices(\'fraud\')\\\">Process All as Fraud Chargeback</button>";' +
+                '    html += "<button type=\\"button\\" class=\\"action-btn nsf-btn\\" style=\\"font-size: 14px; padding: 10px 20px;\\" onclick=\\"processMultipleInvoices(\'nsf\')\\\">Process All as NSF Check</button>";' +
+                '    html += "</div>";' +
+                '    html += "</div>";' +
+                '    return html;' +
+                '}' +
                 'function displayInvoices(data) {' +
                 '    if (data.error) {' +
                 '        document.getElementById("invoiceResults").innerHTML = "<div class=\\"error-msg\\">Error: " + escapeHtmlClient(data.error) + "</div>";' +
@@ -7120,6 +8097,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    var invoices = data.invoices || [];' +
                 '    var deposits = data.deposits || [];' +
                 '    var refunds = data.refunds || [];' +
+                '    var paymentGroups = data.paymentGroups || [];' +
                 '    var html = "";' +
                 '    var hasInvoices = invoices.length > 0;' +
                 '    var hasDeposits = deposits.length > 0;' +
@@ -7149,9 +8127,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '        html += "</div>";' +
                 '    }' +
                 '    if (hasInvoices) {' +
-                '        html += "<div class=\\"search-title\\" style=\\"margin-top: 15px;\\">Paid Invoices</div>";' +
-                '        html += "<div class=\\"search-count\\">Results: " + invoices.length + "</div>";' +
-                '        html += buildInvoicesTable(invoices);' +
+                '        html += "<div class=\\"search-title\\" style=\\"margin-top: 15px;\\">Payment Sources - Paid Invoices Grouped by Origin</div>";' +
+                '        html += "<div class=\\"search-count\\">Invoices grouped by their payment source (deposits, payments, credit memos, etc.)</div>";' +
+                '        html += buildPaymentSourceGroupsTable(paymentGroups);' +
                 '    }' +
                 '    if (hasDeposits) {' +
                 '        html += "<div class=\\"search-title\\" style=\\"margin-top: 25px;\\">Unapplied Customer Deposits</div>";' +
@@ -7190,9 +8168,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '        var hasFraud = inv.hasFraudChargeback || false;' +
                 '        var disabledClass = (hasDispute || hasFraud) ? " disabled" : "";' +
                 '        var disabledAttr = (hasDispute || hasFraud) ? " disabled" : "";' +
-                '        html += "<button type=\\"button\\" class=\\"action-btn chargeback-btn" + disabledClass + "\\"" + disabledAttr + " onclick=\\"processAction(\'chargeback_" + inv.id + "\', \'" + inv.id + "\', \'chargeback\')\\\">Process Dispute Chargeback</button>";' +
-                '        html += "<button type=\\"button\\" class=\\"action-btn fraud-btn" + disabledClass + "\\"" + disabledAttr + " onclick=\\"processAction(\'fraud_" + inv.id + "\', \'" + inv.id + "\', \'fraud\')\\\">Process Fraud Chargeback</button>";' +
-                '        html += "<button type=\\"button\\" class=\\"action-btn nsf-btn\\" onclick=\\"processAction(\'nsf_" + inv.id + "\', \'" + inv.id + "\', \'nsf\')\\\">Process NSF Check</button>";' +
+                '        html += "<button type=\\"button\\" class=\\"action-btn chargeback-btn" + disabledClass + "\\"" + disabledAttr + " onclick=\\"processAction(\'chargeback_" + inv.id + "\', \'" + inv.id + "\', \'chargeback\', \'\', \'\', \'" + inv.amount + "\')\\\">Process Dispute Chargeback</button>";' +
+                '        html += "<button type=\\"button\\" class=\\"action-btn fraud-btn" + disabledClass + "\\"" + disabledAttr + " onclick=\\"processAction(\'fraud_" + inv.id + "\', \'" + inv.id + "\', \'fraud\', \'\', \'\', \'" + inv.amount + "\')\\\">Process Fraud Chargeback</button>";' +
+                '        html += "<button type=\\"button\\" class=\\"action-btn nsf-btn\\" onclick=\\"processAction(\'nsf_" + inv.id + "\', \'" + inv.id + "\', \'nsf\', \'\', \'\', \'" + inv.amount + "\')\\\">Process NSF Check</button>";' +
                 '        html += "</td>";' +
                 '        html += "<td><a href=\\"/app/accounting/transactions/custinvc.nl?id=" + inv.id + "\\" target=\\"_blank\\">" + escapeHtmlClient(inv.tranid) + "</a></td>";' +
                 '        html += "<td>" + escapeHtmlClient(inv.date) + "</td>";' +
@@ -7414,13 +8392,14 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    document.body.appendChild(form);' +
                 '    form.submit();' +
                 '}' +
-                // NEW: Edit partial amount function
-                'function editPartialAmount(invoiceId, originalAmount) {' +
-                '    var currentAmount = partialAmounts[invoiceId] || originalAmount;' +
+                // UPDATED: Edit partial amount function with unique ID support
+                'function editPartialAmount(uniqueId, invoiceId, currentAmount, fullAmount) {' +
+                '    var existingPartial = partialAmounts[uniqueId] || currentAmount;' +
                 '    var promptMsg = "Enter partial amount for this invoice:\\n\\n";' +
-                '    promptMsg += "Original Invoice Amount: $" + parseFloat(originalAmount).toFixed(2) + "\\n";' +
-                '    promptMsg += "\\nEnter amount (cannot exceed original):";' +
-                '    var userInput = prompt(promptMsg, currentAmount);' +
+                '    promptMsg += "Applied from this source: $" + parseFloat(currentAmount).toFixed(2) + "\\n";' +
+                '    promptMsg += "Full Invoice Amount: $" + parseFloat(fullAmount).toFixed(2) + "\\n";' +
+                '    promptMsg += "\\nEnter amount (cannot exceed applied amount from this source):";' +
+                '    var userInput = prompt(promptMsg, existingPartial);' +
                 '    if (userInput === null) return;' +
                 '    var newAmount = parseFloat(userInput);' +
                 '    if (isNaN(newAmount)) {' +
@@ -7431,12 +8410,16 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '        alert("Amount must be greater than zero.");' +
                 '        return;' +
                 '    }' +
-                '    if (newAmount > parseFloat(originalAmount)) {' +
-                '        alert("Amount cannot exceed the original invoice amount of $" + parseFloat(originalAmount).toFixed(2));' +
+                '    if (newAmount > parseFloat(currentAmount)) {' +
+                '        alert("Amount cannot exceed the applied amount from this source of $" + parseFloat(currentAmount).toFixed(2));' +
                 '        return;' +
                 '    }' +
-                '    partialAmounts[invoiceId] = newAmount.toFixed(2);' +
-                '    updateAmountDisplay(invoiceId, originalAmount);' +
+                '    partialAmounts[uniqueId] = newAmount.toFixed(2);' +
+                '    updateAmountDisplay(uniqueId, currentAmount, fullAmount);' +
+                '    if (selectedInvoices[uniqueId]) {' +
+                '        selectedInvoices[uniqueId].amount = newAmount;' +
+                '        updateRunningTotal();' +
+                '    }' +
                 '}' +
                 // NEW: Update amount display
                 'function updateAmountDisplay(invoiceId, originalAmount) {' +
@@ -7456,14 +8439,24 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    html += "✏️ Edit</a>";' +
                 '    amountCell.innerHTML = html;' +
                 '}' +
+                // NEW: Toggle group expand/collapse
+                'function toggleGroup(groupId) {' +
+                '    var groupContent = document.getElementById(groupId);' +
+                '    var groupHeader = groupContent.previousElementSibling;' +
+                '    if (groupContent.classList.contains("collapsed")) {' +
+                '        groupContent.classList.remove("collapsed");' +
+                '        groupHeader.classList.remove("collapsed");' +
+                '    } else {' +
+                '        groupContent.classList.add("collapsed");' +
+                '        groupHeader.classList.add("collapsed");' +
+                '    }' +
+                '}' +
                 // UPDATED: Process action to include partial amount
-                'function processAction(dataId, invoiceId, type) {' +
-                '    var partialAmount = partialAmounts[invoiceId];' +
+                'function processAction(uniqueId, invoiceId, type, sourceId, sourceType, appliedAmount) {' +
+                '    var partialAmount = partialAmounts[uniqueId] || Math.abs(parseFloat(appliedAmount));' +
                 '    var typeText = type === "nsf" ? "NSF Check" : (type === "fraud" ? "Fraud Chargeback" : "Dispute Chargeback");' +
                 '    var confirmMsg = "Are you sure you want to process this " + typeText + "?";' +
-                '    if (partialAmount) {' +
-                '        confirmMsg += "\\n\\nPartial Amount: $" + parseFloat(partialAmount).toFixed(2);' +
-                '    }' +
+                '    confirmMsg += "\\n\\nAmount: $" + Math.abs(parseFloat(partialAmount)).toFixed(2);' +
                 '    if (!confirm(confirmMsg)) {' +
                 '        return;' +
                 '    }' +
@@ -7486,14 +8479,21 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 '    typeInput.name = "type";' +
                 '    typeInput.value = type;' +
                 '    form.appendChild(typeInput);' +
-                // NEW: Add partial amount if set
-                '    if (partialAmount) {' +
-                '        var amountInput = document.createElement("input");' +
-                '        amountInput.type = "hidden";' +
-                '        amountInput.name = "partialAmount";' +
-                '        amountInput.value = partialAmount;' +
-                '        form.appendChild(amountInput);' +
-                '    }' +
+                '    var amountInput = document.createElement("input");' +
+                '    amountInput.type = "hidden";' +
+                '    amountInput.name = "partialAmount";' +
+                '    amountInput.value = partialAmount;' +
+                '    form.appendChild(amountInput);' +
+                '    var sourceIdInput = document.createElement("input");' +
+                '    sourceIdInput.type = "hidden";' +
+                '    sourceIdInput.name = "sourceId";' +
+                '    sourceIdInput.value = sourceId;' +
+                '    form.appendChild(sourceIdInput);' +
+                '    var sourceTypeInput = document.createElement("input");' +
+                '    sourceTypeInput.type = "hidden";' +
+                '    sourceTypeInput.name = "sourceType";' +
+                '    sourceTypeInput.value = sourceType;' +
+                '    form.appendChild(sourceTypeInput);' +
                 '    document.body.appendChild(form);' +
                 '    form.submit();' +
                 '}'
